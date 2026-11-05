@@ -6,6 +6,8 @@
 #include "SoftObjectPtr.h"
 #include "FortInventory.h"
 #include "hooking.h"
+#include "GameplayStatics.h"
+#include <map>
 
 void AFortAthenaCreativePortal::TeleportPlayerToLinkedVolumeHook(UObject* Context, FFrame& Stack, void* Ret)
 {
@@ -45,6 +47,7 @@ void AFortAthenaCreativePortal::TeleportPlayerToLinkedVolumeHook(UObject* Contex
 	auto Location = LinkedVolume->GetActorLocation();
 	Location.Z = 10000; // the island is entered from the sky, like the Xenon server does
 	LOG_INFO(LogCreative, "TeleportPlayerToLinkedVolume: sending the pawn to {} {} {}", Location.X, Location.Y, Location.Z);
+	CreativeIsland::DumpState("before the teleport onto the island");
 	// Location.Z -= 10000; // proper 1:1
 	PlayerPawn->TeleportTo(Location, FRotator());
 
@@ -253,9 +256,20 @@ void CreativeIsland::SetupSettingsMachine(AFortVolume* Volume)
 		return Name##Original(Context, Stack, Ret);                                                                          \
 	}
 
+// The same, and it also writes the whole creative state, for the calls where the state at that moment matters.
+#define XENBONO_CREATIVE_DUMP_HOOK(Name)                                                                                     \
+	static void (*Name##Original)(UObject*, FFrame&, void*) = nullptr;                                                       \
+	static void Name##Hook(UObject* Context, FFrame& Stack, void* Ret)                                                      \
+	{                                                                                                                        \
+		LOG_INFO(LogCreative, "Client called " #Name " on {}", Context ? Context->GetName() : std::string("null"));          \
+		CreativeIsland::DumpState("before " #Name);                                                                          \
+		Name##Original(Context, Stack, Ret);                                                                                 \
+		CreativeIsland::DumpState("after " #Name);                                                                           \
+	}
+
 XENBONO_CREATIVE_LOG_HOOK(ServerClaimPortal)
 XENBONO_CREATIVE_LOG_HOOK(ServerReleasePortal)
-XENBONO_CREATIVE_LOG_HOOK(ServerLoadPlotForPortal)
+XENBONO_CREATIVE_DUMP_HOOK(ServerLoadPlotForPortal)
 XENBONO_CREATIVE_LOG_HOOK(ServerLoadPlotForPortalFromMnemonic)
 XENBONO_CREATIVE_LOG_HOOK(ServerLoadIslandCheckpoint)
 XENBONO_CREATIVE_LOG_HOOK(ServerSaveIslandCheckpoint)
@@ -266,9 +280,9 @@ XENBONO_CREATIVE_LOG_HOOK(ServerSetOnCreativePortalLoadedDelegate)
 // The game calls this every time a prefab is picked in the menu (it sets CurrentPlayset for the prefab to place), so it is only logged.
 XENBONO_CREATIVE_LOG_HOOK(ServerSetPlayset)
 // Start Game / End Game and the island portal.
-XENBONO_CREATIVE_LOG_HOOK(ServerStartMinigame)
-XENBONO_CREATIVE_LOG_HOOK(ServerEndMinigame)
-XENBONO_CREATIVE_LOG_HOOK(ServerRestartMinigame)
+XENBONO_CREATIVE_DUMP_HOOK(ServerStartMinigame)
+XENBONO_CREATIVE_DUMP_HOOK(ServerEndMinigame)
+XENBONO_CREATIVE_DUMP_HOOK(ServerRestartMinigame)
 XENBONO_CREATIVE_LOG_HOOK(ServerSetMinigameClassSlot)
 XENBONO_CREATIVE_LOG_HOOK(ServerToggleAutoRestartMinigame)
 XENBONO_CREATIVE_LOG_HOOK(ServerRespondToAbandonMatch)
@@ -331,4 +345,168 @@ void CreativeIsland::HookControllerFunctions()
 	XENBONO_HOOK_CREATIVE(ServerResetCurrentVolumeWithoutTeleport);
 	XENBONO_HOOK_CREATIVE(ServerSpawnCreativeSupplyDrop);
 #undef XENBONO_HOOK_CREATIVE
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------
+// DumpState
+// ---------------------------------------------------------------------------------------------------------------------
+static std::string Describe(UObject* Object)
+{
+	return Object ? Object->GetName() + " (" + std::to_string(__int64(Object)) + ")" : std::string("null");
+}
+
+static std::string Where(AActor* Actor)
+{
+	if (!Actor)
+		return "null";
+
+	auto Location = Actor->GetActorLocation();
+	return std::format("{} {} {}", Location.X, Location.Y, Location.Z);
+}
+
+static int CountActors(const wchar_t* ClassPath)
+{
+	auto Class = FindObject<UClass>(ClassPath);
+
+	if (!Class)
+		return -1;
+
+	auto Actors = UGameplayStatics::GetAllActorsOfClass(GetWorld(), Class);
+	const int Count = Actors.Num();
+	Actors.Free();
+	return Count;
+}
+
+static void DumpVolume(const char* Label, AFortVolume* Volume)
+{
+	if (!Volume)
+	{
+		LOG_INFO(LogCreative, "  {}: null", Label);
+		return;
+	}
+
+	LOG_INFO(LogCreative, "  {}: {} at {}", Label, Describe(Volume), Where(Volume));
+	LOG_INFO(LogCreative, "    VolumeState {} (3 = ready)", (int)Volume->GetVolumeState());
+
+	static auto CurrentPlaysetOffset = Volume->GetOffset("CurrentPlayset", false);
+
+	if (CurrentPlaysetOffset != -1)
+		LOG_INFO(LogCreative, "    CurrentPlayset {}", Describe(Volume->Get<UObject*>(CurrentPlaysetOffset)));
+
+	static auto LevelSaveClass = FindObject<UClass>("/Script/FortniteGame.FortLevelSaveComponent");
+	static auto StreamClass = FindObject<UClass>("/Script/FortniteGame.PlaysetLevelStreamComponent");
+	static auto MinigameClass = FindObject<UClass>("/Script/FortniteGame.FortMinigameVolumeComponent");
+	static auto LinkClass = FindObject<UClass>("/Script/FortniteGame.FortCreativeVolumeLinkComponent");
+
+	auto LevelSave = LevelSaveClass ? (UObject*)Volume->GetComponentByClass(LevelSaveClass) : nullptr;
+	auto Stream = StreamClass ? (UObject*)Volume->GetComponentByClass(StreamClass) : nullptr;
+	auto MinigameComponent = MinigameClass ? (UObject*)Volume->GetComponentByClass(MinigameClass) : nullptr;
+	auto Link = LinkClass ? (UObject*)Volume->GetComponentByClass(LinkClass) : nullptr;
+
+	LOG_INFO(LogCreative, "    components: level save {}, playset stream {}, minigame {}, creative link {}", Describe(LevelSave), Describe(Stream), Describe(MinigameComponent), Describe(Link));
+
+	if (LevelSave)
+	{
+		auto Bool = [&](const char* Name) -> std::string {
+			auto Offset = LevelSave->GetOffset(Name, false);
+			return Offset == -1 ? "n/a" : (LevelSave->Get<bool>(Offset) ? "true" : "false");
+		};
+
+		static auto PlotOffset = LevelSave->GetOffset("RestrictedPlotDefinition", false);
+		static auto PermissionsOffset = LevelSave->GetOffset("PlotPermissions", false);
+		static auto LoadedPlotOffset = LevelSave->GetOffset("LoadedPlot", false);
+
+		LOG_INFO(LogCreative, "    level save: bIsLoaded {}, bLoadPlaysetFromPlot {}, bAutoLoadFromRestrictedPlotDefinition {}, bCurated {}", Bool("bIsLoaded"), Bool("bLoadPlaysetFromPlot"), Bool("bAutoLoadFromRestrictedPlotDefinition"), Bool("bCurated"));
+		LOG_INFO(LogCreative, "    level save: RestrictedPlotDefinition {}, LoadedPlot {}, PlotPermissions {} (0 private, 1 public)", Describe(PlotOffset == -1 ? nullptr : LevelSave->Get<UObject*>(PlotOffset)), Describe(LoadedPlotOffset == -1 ? nullptr : LevelSave->Get<UObject*>(LoadedPlotOffset)), PermissionsOffset == -1 ? -1 : (int)LevelSave->Get<uint8_t>(PermissionsOffset));
+	}
+
+	if (Stream)
+	{
+		static auto StreamPlaysetOffset = Stream->GetOffset("CurrentPlayset", false);
+		LOG_INFO(LogCreative, "    stream component CurrentPlayset {}", Describe(StreamPlaysetOffset == -1 ? nullptr : Stream->Get<UObject*>(StreamPlaysetOffset)));
+	}
+
+	if (MinigameComponent)
+	{
+		static auto MachineOffset = MinigameComponent->GetOffset("CurrentMinigameSettingsMachine", false);
+		LOG_INFO(LogCreative, "    settings machine {}", Describe(MachineOffset == -1 ? nullptr : MinigameComponent->Get<UObject*>(MachineOffset)));
+	}
+}
+
+void CreativeIsland::DumpState(const std::string& Reason, int MaxTimes)
+{
+	static std::map<std::string, int> Times;
+
+	if (Times[Reason]++ >= MaxTimes)
+		return;
+
+	LOG_INFO(LogCreative, "======== creative state: {} ========", Reason);
+
+	LOG_INFO(LogCreative, "actors: {} volumes, {} minigames, {} portals, {} building pieces", CountActors(L"/Script/FortniteGame.FortVolume"), CountActors(L"/Script/FortniteGame.FortMinigame"), CountActors(L"/Script/FortniteGame.FortAthenaCreativePortal"), CountActors(L"/Script/FortniteGame.BuildingSMActor"));
+
+	static auto ControllerClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerControllerAthena");
+
+	if (!ControllerClass)
+	{
+		LOG_WARN(LogCreative, "FortPlayerControllerAthena was not found, cannot list players");
+		return;
+	}
+
+	auto Controllers = UGameplayStatics::GetAllActorsOfClass(GetWorld(), ControllerClass);
+
+	for (int i = 0; i < Controllers.Num(); ++i)
+	{
+		auto Controller = (AFortPlayerControllerAthena*)Controllers.at(i);
+
+		if (!Controller)
+			continue;
+
+		LOG_INFO(LogCreative, "player {}", Describe(Controller));
+
+		auto Pawn = Controller->GetMyFortPawn();
+		LOG_INFO(LogCreative, "  pawn {} at {}", Describe(Pawn), Where(Pawn));
+
+		static auto OwnedPortalOffset = Controller->GetOffset("OwnedPortal", false);
+		static auto CurrentPlaysetOffset = Controller->GetOffset("CurrentPlayset", false);
+
+		auto OwnedPortal = OwnedPortalOffset == -1 ? nullptr : Controller->Get<AFortAthenaCreativePortal*>(OwnedPortalOffset);
+
+		LOG_INFO(LogCreative, "  OwnedPortal {}, CurrentPlayset {}", Describe(OwnedPortal), Describe(CurrentPlaysetOffset == -1 ? nullptr : Controller->Get<UObject*>(CurrentPlaysetOffset)));
+
+		auto LinkedVolume = Controller->GetCreativePlotLinkedVolume();
+		DumpVolume("CreativePlotLinkedVolume", LinkedVolume);
+
+		// The game's own answers about this player and island.
+		if (auto OwnsFn = Controller->FindFunction("OwnsIslandVolume"))
+		{
+			struct { AFortVolume* Volume; bool ReturnValue; } Params{ LinkedVolume, false };
+			Controller->ProcessEvent(OwnsFn, &Params);
+			LOG_INFO(LogCreative, "  OwnsIslandVolume(linked volume): {}", Params.ReturnValue);
+		}
+
+		if (auto PlayerState = Controller->GetPlayerState())
+		{
+			if (auto CanEditFn = PlayerState->FindFunction("CanEditCreativeIsland"))
+			{
+				struct { bool ReturnValue; } Params{ false };
+				PlayerState->ProcessEvent(CanEditFn, &Params);
+				LOG_INFO(LogCreative, "  CanEditCreativeIsland: {}", Params.ReturnValue);
+			}
+		}
+
+		if (OwnedPortal)
+		{
+			auto Bool = [&](const char* Name) -> std::string {
+				auto Offset = OwnedPortal->GetOffset(Name, false);
+				return Offset == -1 ? "n/a" : (OwnedPortal->Get<bool>(Offset) ? "true" : "false");
+			};
+
+			LOG_INFO(LogCreative, "  portal {} at {}: bPortalOpen {}, bUserInitiatedLoad {}, bInErrorState {}, bIsPublishedPortal {}, bReturnToCreativeHub {}", Describe(OwnedPortal), Where(OwnedPortal), Bool("bPortalOpen"), Bool("bUserInitiatedLoad"), Bool("bInErrorState"), Bool("bIsPublishedPortal"), Bool("bReturnToCreativeHub"));
+			DumpVolume("portal LinkedVolume", OwnedPortal->GetLinkedVolume());
+		}
+	}
+
+	Controllers.Free();
+	LOG_INFO(LogCreative, "======== end of creative state ========");
 }

@@ -97,4 +97,6 @@ namespace CreativeIsland
 	void SetupSettingsMachine(class AFortVolume* Volume);
 	/** Logs every creative call the client makes to the server. */
 	void HookControllerFunctions();
+	/** Writes everything about the islands, portals, volumes, players and permissions to the log. Each reason is written at most a few times. */
+	void DumpState(const std::string& Reason, int MaxTimes = 3);
 }

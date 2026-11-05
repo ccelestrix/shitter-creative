@@ -1,4 +1,5 @@
 #include "FortPlayerController.h"
+#include "FortAthenaCreativePortal.h"
 
 #include "Rotator.h"
 #include "BuildingSMActor.h"
@@ -853,12 +854,18 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 	auto WorldInventory = PlayerController->GetWorldInventory();
 
 	if (!WorldInventory)
+	{
+		if (IsCreativeGame()) LOG_WARN(LogCreative, "ServerCreateBuildingActor refused: the player has no world inventory");
 		return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
+	}
 
 	auto PlayerStateAthena = Cast<AFortPlayerStateAthena, false>(PlayerController->GetPlayerState());
 
 	if (!PlayerStateAthena)
+	{
+		if (IsCreativeGame()) LOG_WARN(LogCreative, "ServerCreateBuildingActor refused: the player has no player state");
 		return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
+	}
 
 	UClass* BuildingClass = nullptr;
 	FVector BuildLocation;
@@ -896,7 +903,13 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 	// LOG_INFO(LogDev, "BuildingClass {}", __int64(BuildingClass));
 
 	if (!BuildingClass)
+	{
+		if (IsCreativeGame()) LOG_WARN(LogCreative, "ServerCreateBuildingActor refused: no building class could be read from the request");
 		return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
+	}
+
+	if (IsCreativeGame())
+		CreativeIsland::DumpState("first building requests", 2);
 
 	LOG_INFO(LogCreative, "ServerCreateBuildingActor: {} wants {} at {} {} {}", PlayerController->GetName(), BuildingClass->GetName(), BuildLocation.X, BuildLocation.Y, BuildLocation.Z);
 
@@ -923,6 +936,7 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 
 	if (!GameState->IsPlayerBuildableClass(BuildingClass))
 	{
+		if (IsCreativeGame()) LOG_WARN(LogCreative, "ServerCreateBuildingActor refused: {} is not a player buildable class", BuildingClass->GetName());
 		LOG_INFO(LogDev, "Cheater most likely.");
 		// PlayerController->GetAnticheatComponent().AddAndCheck(Severity::HIGH);
 		return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
@@ -935,6 +949,7 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 
 	if (!bCanBuild)
 	{
+		if (IsCreativeGame()) LOG_WARN(LogCreative, "ServerCreateBuildingActor refused: CantBuild says the spot is blocked ({} existing pieces in the way)", ExistingBuildings.Num());
 		ExistingBuildings.Free();
 		return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
 	}
@@ -948,6 +963,7 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 
 	if (!BuildingActor)
 	{
+		if (IsCreativeGame()) LOG_WARN(LogCreative, "ServerCreateBuildingActor refused: spawning {} failed", BuildingClass->GetName());
 		ExistingBuildings.Free();
 		return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
 	}
@@ -966,6 +982,7 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 
 		if (!MatInstance || MatInstance->GetItemEntry()->GetCount() < MaterialCost)
 		{
+			if (IsCreativeGame()) LOG_WARN(LogCreative, "ServerCreateBuildingActor refused: not enough materials (bBuildFree was false)");
 			ExistingBuildings.Free();
 			BuildingActor->SilentDie();
 			return ServerCreateBuildingActorOriginal(Context, Stack, Ret);

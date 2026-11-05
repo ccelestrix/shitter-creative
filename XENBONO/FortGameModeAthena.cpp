@@ -1837,6 +1837,7 @@ void AFortGameModeAthena::Athena_HandleStartingNewPlayerHook(AFortGameModeAthena
 			CreativeIsland::CallOnRep(Portal->GetLinkedVolume(), "OnRep_VolumeState");
 			CreativeIsland::CallOnRep(NewPlayer, "OnRep_CreativePlotLinkedVolume");
 			CreativeIsland::SetupSettingsMachine(Portal->GetLinkedVolume());
+			CreativeIsland::DumpState("island set up for a new player");
 
 			LOG_INFO(LogCreative, "Initialized player portal!");
 		}

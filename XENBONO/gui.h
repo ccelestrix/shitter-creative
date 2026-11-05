@@ -26,6 +26,7 @@
 #include "FortAthenaMutator_Disco.h"
 #include "globals.h"
 #include "Fonts/ruda-bold.h"
+#include "FortAthenaCreativePortal.h"
 #include "XenbonoTheme.h" // the look: same as the Xenon game server window
 #include "Vector.h"
 #include "xenbono.h"
@@ -323,6 +324,9 @@ static int playerTabTab = MAIN_PLAYERTAB;
 
 static inline void StaticUI()
 {
+	if (IsCreativeGame() && ImGui::Button("Write the creative state to the log"))
+		CreativeIsland::DumpState("button", 1000);
+
 	if (IsRestartingSupported())
 	{
 		// ImGui::Checkbox("Auto Restart", &Globals::bAutoRestart);

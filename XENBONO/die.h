@@ -30,10 +30,14 @@ static inline void LogCreativeProcessEvent(UObject* Object, UFunction* Function)
 
 		auto Has = [&FullName](const char* Text) { return FullName.find(Text) != std::string::npos; };
 
-		const bool bInteresting = (Has("Playset") || Has("Volume") || Has("Grenade") || Has("Minigame") || Has("Creative") || Has("Prefab") || Has("Plot") || Has("Island") || Has("Thermometer") || Has("Throw") || Has("Building:") || Has("BuildingSMActor") || Has("BuildingActor"))
+		// Every request the client makes of the server (except the movement and camera spam), so a button that does nothing shows up.
+		const bool bServerRequest = Has(":Server") && !Has("ServerMove") && !Has("ServerUpdate") && !Has("ServerTouch") && !Has("ServerAck") && !Has("ServerCheckClient") && !Has("ServerSetSpectator")
+			&& !Has("ServerSendClient") && !Has("ServerNotifyLoaded") && !Has("ServerSetClientTimeStamp") && !Has("ServerCamera") && !Has("ServerRotate") && !Has("ServerPawn");
+
+		const bool bInteresting = bServerRequest || Has("Projectile") || Has("Explod") || Has("Detonat") || (Has("Playset") || Has("Volume") || Has("Grenade") || Has("Minigame") || Has("Creative") || Has("Prefab") || Has("Plot") || Has("Island") || Has("Thermometer") || Has("Throw") || Has("Building:") || Has("BuildingSMActor") || Has("BuildingActor"))
 			&& !Has("Audio") && !Has("Sound") && !Has("Submix") && !Has("PostProcess") && !Has("Physics") && !Has("LevelStreamingVolume") && !Has("Tick") && !Has("Animation") && !Has("Anim");
 
-		Found = CallsLeft.emplace(Function, bInteresting ? 25 : -1).first;
+		Found = CallsLeft.emplace(Function, bInteresting ? 40 : -1).first;
 	}
 
 	if (Found->second <= 0)
