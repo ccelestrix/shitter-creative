@@ -3,14 +3,53 @@
 #include "xenbono.h"
 #include "FortGameModeAthena.h"
 
+#include <mutex>
+#include <unordered_map>
+
 extern inline void (*SetZoneToIndexOriginal)(AFortGameModeAthena* GameModeAthena, int OverridePhaseMaybeIDFK) = nullptr;
 
 void SetZoneToIndexHook(AFortGameModeAthena* GameModeAthena, int OverridePhaseMaybeIDFK);
+
+// True once ProcessEvent is hooked (by Creative at startup, or by the "Log ProcessEvent" tick box), so it is never hooked twice.
+extern inline bool bProcessEventHooked = false;
+
+// In Creative, writes the blueprint functions about prefabs, volumes, grenades, minigames and islands to xenbono_creative.log, so a
+// throw that does nothing can be followed. Each function is judged once, and only its first calls are written.
+static inline void LogCreativeProcessEvent(UObject* Object, UFunction* Function)
+{
+	static std::unordered_map<UFunction*, int> CallsLeft; // -1: not interesting
+	static std::mutex Lock;
+
+	std::lock_guard<std::mutex> guard(Lock);
+
+	auto Found = CallsLeft.find(Function);
+
+	if (Found == CallsLeft.end())
+	{
+		const auto FullName = Function->GetFullName();
+
+		auto Has = [&FullName](const char* Text) { return FullName.find(Text) != std::string::npos; };
+
+		const bool bInteresting = (Has("Playset") || Has("Volume") || Has("Grenade") || Has("Minigame") || Has("Creative") || Has("Prefab") || Has("Plot") || Has("Island") || Has("Thermometer") || Has("Throw"))
+			&& !Has("Audio") && !Has("Sound") && !Has("Submix") && !Has("PostProcess") && !Has("Physics") && !Has("LevelStreamingVolume") && !Has("Tick") && !Has("Animation") && !Has("Anim");
+
+		Found = CallsLeft.emplace(Function, bInteresting ? 25 : -1).first;
+	}
+
+	if (Found->second <= 0)
+		return;
+
+	Found->second--;
+	LOG_INFO(LogCreative, "ProcessEvent {} on {}", Function->GetFullName(), Object->GetName());
+}
 
 static inline void ProcessEventHook(UObject* Object, UFunction* Function, void* Parameters)
 {
 	if (!Object || !Function)
 		return;
+
+	if (IsCreativeGame())
+		LogCreativeProcessEvent(Object, Function);
 
 	if (Globals::bLogProcessEvent)
 	{

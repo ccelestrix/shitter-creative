@@ -742,7 +742,14 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 
 		if (ActorsNum == 0)
 		{
-			// LOG_INFO(LogDev, "No Actors!");
+			static bool bLoggedNoStarts = false;
+
+			if (!bLoggedNoStarts)
+			{
+				bLoggedNoStarts = true;
+				LOG_WARN(LogCreative, "Not ready to start: there are no {} actors in the map", Globals::bCreative ? "FortPlayerStartCreative" : "FortPlayerStartWarmup");
+			}
+
 			return false;
 		}
 	}
@@ -751,10 +758,22 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 
 	auto MapInfo = GameState->GetMapInfo();
 
+	// The Creative tick box opens the creative map, which has no Athena map info, so it must not wait for one.
 	if (Engine_Version >= 421 // todo recheck this version 
 		&& (bIsAthenaMap ? !MapInfo : false)
+		&& !Globals::bCreative
 		)
+	{
+		static bool bLoggedNoMapInfo = false;
+
+		if (!bLoggedNoMapInfo)
+		{
+			bLoggedNoMapInfo = true;
+			LOG_WARN(LogCreative, "Not ready to start: the map has no FortAthenaMapInfo");
+		}
+
 		return false;
+	}
 
 	static int LastNum = 1;
 
