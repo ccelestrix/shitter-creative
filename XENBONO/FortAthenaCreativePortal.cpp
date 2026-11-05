@@ -674,7 +674,29 @@ void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 		}
 
 		AlreadyLoaded.insert(Name);
-		LOG_INFO(LogCreative, "Thrown prefab: {} (playset {} from {}) at {} is in state {}; asking the volume manager to activate queued volumes", Name, UsePlayset->GetName(), Source, Where(Volume), (int)Volume->GetVolumeState());
+		static auto PrefabStreamClass = FindObject<UClass>("/Script/FortniteGame.PlaysetLevelStreamComponent");
+		auto HasStream = [&]() -> bool { return PrefabStreamClass && Volume->GetComponentByClass(PrefabStreamClass) != nullptr; };
+
+		LOG_INFO(LogCreative, "Thrown prefab: {} (playset {} from {}) at {} is in state {}, stream component {}", Name, UsePlayset->GetName(), Source, Where(Volume), (int)Volume->GetVolumeState(), HasStream() ? "present" : "missing");
+
+		// Step 1: the game's native SpawnVolume sets the volume's playset directly and skips the SetCurrentPlayset function, which is the one that
+		// would set the volume up for loading. Call that function (clearing the field first, so it does not see "nothing changed").
+		static auto VolumePlaysetFieldOffset = Volume->GetOffset("CurrentPlayset", false);
+
+		if (VolumePlaysetFieldOffset != -1)
+			Volume->Get<UObject*>(VolumePlaysetFieldOffset) = nullptr;
+
+		Volume->SetCurrentPlayset(UsePlayset);
+		LOG_INFO(LogCreative, "Thrown prefab: SetCurrentPlayset called; {} is in state {}, stream component {}", Name, (int)Volume->GetVolumeState(), HasStream() ? "present" : "missing");
+
+		// Step 2: only if the volume now has a stream component can the playset be streamed into it.
+		if (HasStream())
+		{
+			UFortPlaysetItemDefinition::ShowPlayset(UsePlayset, Volume);
+			LOG_INFO(LogCreative, "Thrown prefab: streamed the playset into {}", Name);
+		}
+
+		// Step 3: the volume manager's queue, as the game does when a volume is waiting.
 
 		// The prefab volume has no stream component of its own and starts Uninitialized (0): the game activates such volumes from the volume manager's
 		// queue (TryActivateQueuedVolumes). Nothing is forced on the volume here, in earlier tests forcing it was followed by a crash.
