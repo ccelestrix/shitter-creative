@@ -6,7 +6,7 @@
 
 namespace Globals
 {
-	extern inline bool bCreative = false;
+	extern inline bool bCreative = true; // XENBONO defaults to Creative (see PlaylistName)
 	extern inline bool bGoingToPlayEvent = false;
 	extern inline bool bEnableAGIDs = true;
 	extern inline bool bNoMCP = true;
@@ -31,7 +31,8 @@ namespace Globals
 extern inline int NumToSubtractFromSquadId = 0; // I think 2?
 
 extern inline std::string PlaylistName =
-"/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo";
+"/Game/Athena/Playlists/Creative/Playlist_PlaygroundV2.Playlist_PlaygroundV2";
+// "/Game/Athena/Playlists/Playlist_DefaultSolo.Playlist_DefaultSolo";
 // "/Game/Athena/Playlists/gg/Playlist_Gg_Reverse.Playlist_Gg_Reverse";
 // "/Game/Athena/Playlists/Playlist_DefaultDuo.Playlist_DefaultDuo";
 // "/Game/Athena/Playlists/Playground/Playlist_Playground.Playlist_Playground";
