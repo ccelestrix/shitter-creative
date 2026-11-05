@@ -103,4 +103,6 @@ namespace CreativeIsland
 	void LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset);
 	/** Writes the state of every minigame whose state changed since the last call (PreGame, Setup, ... InProgress). */
 	void LogMinigameStates(const char* Why);
+	/** Writes the island's creative budget (the "memory used" bar at the top): total and used per category. */
+	void LogBudget(const char* Why, int MaxTimes = 40);
 }

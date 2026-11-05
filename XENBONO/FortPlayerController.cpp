@@ -1011,7 +1011,10 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 	BuildingActor->SetTeam(PlayerStateAthena->GetTeamIndex()); // required?
 
 	if (IsCreativeGame())
+	{
 		LOG_INFO(LogCreative, "ServerCreateBuildingActor: placed {} at {} {} {} ourselves, {} pieces of this class exist now", BuildingClass->GetName(), BuildLocation.X, BuildLocation.Y, BuildLocation.Z, CountPieces());
+		CreativeIsland::LogBudget("after a placed piece");
+	}
 
 	/*
 

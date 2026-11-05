@@ -406,6 +406,7 @@ static void DumpVolume(const char* Label, AFortVolume* Volume)
 	auto Link = LinkClass ? (UObject*)Volume->GetComponentByClass(LinkClass) : nullptr;
 
 	LOG_INFO(LogCreative, "    components: level save {}, playset stream {}, minigame {}, creative link {}", Describe(LevelSave), Describe(Stream), Describe(MinigameComponent), Describe(Link));
+	CreativeIsland::LogBudget("volume dump", 1000);
 
 	if (LevelSave)
 	{
@@ -724,4 +725,62 @@ void CreativeIsland::LogMinigameStates(const char* Why)
 	}
 
 	Minigames.Free();
+}
+
+void CreativeIsland::LogBudget(const char* Why, int MaxTimes)
+{
+	static int Times = 0;
+
+	if (Times++ >= MaxTimes)
+		return;
+
+	static auto ControllerClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerControllerAthena");
+	static auto TrackingClass = FindObject<UClass>("/Script/FortniteGame.FortVolumeObjectTrackingComponent");
+	static const char* Categories[] = { "Memory", "Simulation", "Rendering", "Network", "Audio" };
+
+	if (!ControllerClass || !TrackingClass)
+		return;
+
+	auto Controllers = UGameplayStatics::GetAllActorsOfClass(GetWorld(), ControllerClass);
+
+	for (int c = 0; c < Controllers.Num(); ++c)
+	{
+		auto Controller = (AFortPlayerControllerAthena*)Controllers.at(c);
+		auto Volume = Controller ? Controller->GetCreativePlotLinkedVolume() : nullptr;
+		auto Tracking = Volume ? (UObject*)Volume->GetComponentByClass(TrackingClass) : nullptr;
+
+		if (!Tracking)
+		{
+			LOG_INFO(LogCreative, "Budget ({}): {} has no object tracking component on its island volume", Why, Describe(Controller));
+			continue;
+		}
+
+		static auto TrackerOffset = Tracking->GetOffset("BudgetTracker", false);
+		static auto RunNewVersionOffset = Tracking->GetOffset("bRunNewVersion", false);
+		static auto HeatmapOffset = Tracking->GetOffset("bHeatmapEnabled", false);
+
+		if (TrackerOffset == -1)
+		{
+			LOG_WARN(LogCreative, "Budget ({}): no BudgetTracker property on the tracking component", Why);
+			continue;
+		}
+
+		// FFortCreativeBudgetTracker keeps its TArray<FFortCreativeBudget> at +0x10; each entry is 0x14 bytes: TotalBudget, UsedBudget, Category (uint8 at +8), FixedInstanceCost (+0x10).
+		auto Array = (char*)Tracking + TrackerOffset + 0x10;
+		auto Data = *(char**)Array;
+		const int Num = *(int*)(Array + 8);
+
+		std::string Text = std::format("Budget ({}), bRunNewVersion {}, heatmap {}: {} categories", Why, RunNewVersionOffset == -1 ? -1 : (int)Tracking->Get<bool>(RunNewVersionOffset), HeatmapOffset == -1 ? -1 : (int)Tracking->Get<bool>(HeatmapOffset), Num);
+
+		for (int i = 0; Data && i < Num && i < 8; ++i)
+		{
+			auto Entry = Data + i * 0x14;
+			const int Category = *(uint8_t*)(Entry + 8);
+			Text += std::format(" | {} used {} of {} (fixed instance cost {})", Category >= 0 && Category <= 4 ? Categories[Category] : "?", *(int*)(Entry + 4), *(int*)Entry, *(int*)(Entry + 0x10));
+		}
+
+		LOG_INFO(LogCreative, "{}", Text);
+	}
+
+	Controllers.Free();
 }
