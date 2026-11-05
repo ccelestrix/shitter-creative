@@ -43,3 +43,9 @@ The Fortnite executable has no dedicated-server code, so some of Creative's serv
   Actor probes write `Actor probe '...' after N ms: M new actors: ...` with the class and position of the new actors.
 - **Memory bar**: logged (`Budget (...)`), the cost directory is reported and loaded; costs are not computed yet.
 - **Islands / settings / devices**: partly present; see the log lines for what each call did.
+
+## If the server never becomes joinable (stuck on the loading screen)
+- The server only starts listening once the creative hub's `FortPlayerStartCreative` actors exist. They come from the hub level (`CreativeHub_S11_01_Creative_Spawns`), one of the playlist's three levels. The playlist levels are not streamed by the game state: `StreamLevel` spawns a `BuildingFoundation3x3` actor for each level and that actor streams it, so a lost request is never repeated by the game.
+- While the player starts are missing, `xenbono_creative.log` says every 4 seconds (every 20 s after the first 80 s): which world this is, how many player starts exist, which of the playlist's levels have a streaming level (`MISSING` if not), what each streaming level is doing (loaded, visible, pending, should-be-loaded) and what each streaming foundation holds.
+- After 8 s a creative streaming level that exists but is not loaded is told to load and become visible. After 10 s, and again after 30 s, a playlist level that still has no streaming level at all is requested again (only that level, so nothing is loaded twice). Each of these is logged as a warning.
+- If it still never listens, the useful extra file is the engine log of the server process (`FortniteGame\Saved\Logs\FortniteGame.log` next to the exe), which holds the real load error.

@@ -312,17 +312,65 @@ void SetupEverythingAI() // find better name lol
 	// SetupNavConfig(UKismetStringLibrary::Conv_StringToName(L"MANG"));
 }
 
-// While the server waits for the creative hub's player starts it says, every few seconds, what the world's streaming levels are doing (the hub is
-// a streamed level, and if it never loads the server never becomes joinable). A hub level that exists but is not loading is asked to load again,
-// and if no streaming level for the hub exists at all the playlist's levels are requested once more.
+// While the server waits for the creative hub's player starts it says, every few seconds, what the world's streaming levels are doing. The playlist's
+// levels (the hub among them) are not streamed by the game state: StreamLevel spawns a BuildingFoundation3x3 actor for each one and that actor streams it.
+// If a request was lost (no streaming level for that level exists after a while) it is made again for that level only, and a streaming level that exists
+// but does not load is asked to load.
 static ULONGLONG HubWaitingSince = 0;
+
+static std::string LevelShortName(const std::string& Path)
+{
+	// "/Game/Creative/Maps/GroupMaster/CP_Island_GroupMaster.CP_Island_GroupMaster" -> "CP_Island_GroupMaster"
+	const auto Slash = Path.find_last_of('/');
+	const auto Name = Slash == std::string::npos ? Path : Path.substr(Slash + 1);
+	const auto Dot = Name.find('.');
+	return Dot == std::string::npos ? Name : Name.substr(0, Dot);
+}
+
+// What the foundations that stream the playlist levels hold (the level they should stream and whether they are enabled).
+static void ReportStreamingFoundations()
+{
+	static auto FoundationClass = FindObject<UClass>(L"/Script/FortniteGame.BuildingFoundation3x3");
+
+	if (!FoundationClass)
+		return;
+
+	auto Actors = UGameplayStatics::GetAllActorsOfClass(GetWorld(), FoundationClass);
+	int Shown = 0;
+
+	for (int i = 0; i < Actors.Num() && Shown < 12; ++i)
+	{
+		auto Foundation = Actors.at(i);
+
+		if (!Foundation)
+			continue;
+
+		static auto LevelToStreamOffset = Foundation->GetOffset("LevelToStream", false);
+		static auto EnabledStateOffset = Foundation->GetOffset("FoundationEnabledState", false);
+
+		if (LevelToStreamOffset == -1)
+			continue;
+
+		const std::string Level = Foundation->Get<FName>(LevelToStreamOffset).ToString();
+
+		if (Level.empty() || Level == "None")
+			continue;
+
+		++Shown;
+		const auto Location = Foundation->GetActorLocation();
+		LOG_INFO(LogCreative, "  streaming foundation {}: level to stream {}, enabled state {}, at {:.0f} {:.0f} {:.0f}", Foundation->GetName(), Level,
+			EnabledStateOffset == -1 ? -1 : (int)Foundation->Get<uint8_t>(EnabledStateOffset), (double)Location.X, (double)Location.Y, (double)Location.Z);
+	}
+
+	Actors.Free();
+}
 
 static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 {
 	static ULONGLONG LastReport = 0;
 	static int Reports = 0;
 	static bool bNudged = false;
-	static bool bRequestedAgain = false;
+	static int Requests = 0; // how many times the missing levels were requested again
 
 	const ULONGLONG Now = GetTickCount64();
 
@@ -330,9 +378,11 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 		HubWaitingSince = Now;
 
 	const ULONGLONG Waited = Now - HubWaitingSince;
-	const bool bReport = Now - LastReport >= 4000 && Reports < 20;
+	const bool bReport = Now - LastReport >= (Reports < 20 ? 4000 : 20000) && Reports < 40;
+	const bool bNudge = !bNudged && Waited >= 8000;
+	const bool bRequest = (Requests == 0 && Waited >= 10000) || (Requests == 1 && Waited >= 30000);
 
-	if (!bReport && (bNudged || Waited < 12000) && (bRequestedAgain || Waited < 25000))
+	if (!bReport && !bNudge && !bRequest)
 		return;
 
 	if (bReport)
@@ -340,6 +390,9 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 		LastReport = Now;
 		++Reports;
 	}
+
+	if (bNudge)
+		bNudged = true;
 
 	auto World = GetWorld();
 	static auto StreamingOffset = World->GetOffset("StreamingLevels", false);
@@ -353,10 +406,11 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 	}
 
 	auto& Levels = World->Get<TArray<UObject*>>(StreamingOffset);
-	bool bHubLevelExists = false;
+	std::vector<std::string> LevelPaths;
+	bool bUnknownPath = false;
 	std::string Summary;
 
-	for (int i = 0; i < Levels.Num() && i < 30; ++i)
+	for (int i = 0; i < Levels.Num() && i < 40; ++i)
 	{
 		auto Level = Levels.at(i);
 
@@ -367,7 +421,7 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 		static auto FlagsOffset = Level->GetOffset("bShouldBeLoaded", false); // the byte that holds bShouldBeVisible (bit 3) and bShouldBeLoaded (bit 4)
 		static auto LoadedLevelOffset = Level->GetOffset("LoadedLevel", false);
 
-		std::string Path = Level->GetName();
+		std::string Path;
 
 		if (WorldAssetOffset != -1)
 		{
@@ -376,6 +430,14 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 			if (Asset.IsValid())
 				Path = Asset.SoftObjectPtr.ObjectID.AssetPathName.ToString();
 		}
+
+		if (Path.empty() || Path == "None")
+		{
+			bUnknownPath = true;
+			Path = Level->GetName();
+		}
+
+		LevelPaths.push_back(Path);
 
 		auto Ask = [&](const char* Function) -> int {
 			struct { bool ReturnValue; } Params{ false };
@@ -389,20 +451,21 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 			return -1;
 		};
 
-		const int Loaded = Ask("IsLevelLoaded");
-		const int Visible = Ask("IsLevelVisible");
-		const int Pending = Ask("IsStreamingStatePending");
-		const int Flags = FlagsOffset == -1 ? -1 : (int)*(unsigned char*)((char*)Level + FlagsOffset);
 		const bool bHub = Path.find("CreativeHub") != std::string::npos || Path.find("CP_Island") != std::string::npos || Path.find("Apollo_CP_Boundary") != std::string::npos;
-
-		bHubLevelExists = bHubLevelExists || bHub;
+		const int Loaded = (bReport || (bNudge && bHub)) ? Ask("IsLevelLoaded") : -1;
 
 		if (bReport)
-			Summary += std::format("\n  {}{}: loaded {}, visible {}, pending {}, shouldBeLoaded {}, shouldBeVisible {}, loaded level {}", bHub ? "[creative] " : "", Path, Loaded, Visible, Pending, Flags == -1 ? -1 : (Flags >> 4) & 1,
-				Flags == -1 ? -1 : (Flags >> 3) & 1, LoadedLevelOffset == -1 ? "n/a" : (Level->Get<UObject*>(LoadedLevelOffset) ? "yes" : "no"));
+		{
+			const int Visible = Ask("IsLevelVisible");
+			const int Pending = Ask("IsStreamingStatePending");
+			const int Flags = FlagsOffset == -1 ? -1 : (int)*(unsigned char*)((char*)Level + FlagsOffset);
 
-		// A hub level that exists but is not loading is asked to load.
-		if (bHub && !bNudged && Waited >= 12000 && Loaded == 0)
+			Summary += std::format("\n  {}{}: loaded {}, visible {}, pending {}, shouldBeLoaded {}, shouldBeVisible {}, loaded level {}", bHub ? "[creative] " : "", Path, Loaded, Visible, Pending,
+				Flags == -1 ? -1 : (Flags >> 4) & 1, Flags == -1 ? -1 : (Flags >> 3) & 1, LoadedLevelOffset == -1 ? "n/a" : (Level->Get<UObject*>(LoadedLevelOffset) ? "yes" : "no"));
+		}
+
+		// A creative streaming level that exists but is not loading is asked to load.
+		if (bNudge && bHub && Loaded == 0)
 		{
 			if (auto Fn = Level->FindFunction("SetShouldBeLoaded")) { bool b = true; Level->ProcessEvent(Fn, &b); }
 			if (auto Fn = Level->FindFunction("SetShouldBeVisible")) { bool b = true; Level->ProcessEvent(Fn, &b); }
@@ -410,45 +473,71 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 		}
 	}
 
-	if (Waited >= 12000)
-		bNudged = true;
+	// Which of the playlist's levels have a streaming level and which do not.
+	GET_PLAYLIST(GameState);
+
+	std::vector<FName> Missing;
+	std::string PlaylistSummary;
+
+	if (CurrentPlaylist)
+	{
+		static auto AdditionalLevelsOffset = CurrentPlaylist->GetOffset("AdditionalLevels", false);
+
+		if (AdditionalLevelsOffset != -1)
+		{
+			auto& AdditionalLevels = CurrentPlaylist->Get<TArray<TSoftObjectPtr<UWorld>>>(AdditionalLevelsOffset);
+
+			for (int i = 0; i < AdditionalLevels.Num(); ++i)
+			{
+				const FName LevelName = AdditionalLevels.at(i).SoftObjectPtr.ObjectID.AssetPathName;
+				const std::string Short = LevelShortName(LevelName.ToString());
+				bool bPresent = false;
+
+				for (auto& Path : LevelPaths)
+					bPresent = bPresent || Path.find(Short) != std::string::npos;
+
+				PlaylistSummary += std::format(" {}={}", Short, bPresent ? "has a streaming level" : "MISSING");
+
+				if (!bPresent)
+					Missing.push_back(LevelName);
+			}
+		}
+	}
 
 	if (bReport)
 	{
-		auto StartCreativeClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStartCreative");
+		static auto StartCreativeClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStartCreative");
 		auto Starts = StartCreativeClass ? UGameplayStatics::GetAllActorsOfClass(GetWorld(), StartCreativeClass) : TArray<AActor*>();
 		const int StartCount = Starts.Num();
 
 		if (StartCreativeClass)
 			Starts.Free();
 
-		LOG_INFO(LogCreative, "Waiting for the creative hub ({} s): {} FortPlayerStartCreative actors, {} streaming levels{}", (int)(Waited / 1000), StartCount, Levels.Num(), Summary);
+		LOG_INFO(LogCreative, "Waiting for the creative hub ({} s) in world {}: {} FortPlayerStartCreative actors, {} streaming levels, playlist levels:{}{}", (int)(Waited / 1000), World->GetName(), StartCount,
+			Levels.Num(), PlaylistSummary.empty() ? std::string(" unknown") : PlaylistSummary, Summary);
+
+		ReportStreamingFoundations();
 	}
 
-	// No streaming level for the hub was ever created: the request made when the playlist was set up was lost, make it again (once).
-	if (Waited >= 25000 && !bRequestedAgain && !bHubLevelExists)
+	// A playlist level that still has no streaming level was lost on the way: it is requested again, the same way the first request was made.
+	if (bRequest)
 	{
-		bRequestedAgain = true;
+		++Requests;
 
-		GET_PLAYLIST(GameState);
-
-		if (CurrentPlaylist)
+		if (bUnknownPath)
 		{
-			static auto AdditionalLevelsOffset = CurrentPlaylist->GetOffset("AdditionalLevels", false);
-
-			if (AdditionalLevelsOffset != -1)
+			LOG_WARN(LogCreative, "Waiting for the creative hub: {} s, but a streaming level has no readable path, so no level is requested again", (int)(Waited / 1000));
+		}
+		else
+		{
+			for (auto& Name : Missing)
 			{
-				auto& AdditionalLevels = CurrentPlaylist->Get<TArray<TSoftObjectPtr<UWorld>>>(AdditionalLevelsOffset);
-				LOG_WARN(LogCreative, "Waiting for the creative hub: no streaming level for it exists after {} s, requesting the playlist's {} levels again", (int)(Waited / 1000), AdditionalLevels.Num());
-
-				for (int i = 0; i < AdditionalLevels.Num(); i++)
-					GameState->AddToAdditionalPlaylistLevelsStreamed(AdditionalLevels.at(i).SoftObjectPtr.ObjectID.AssetPathName);
-
-				static auto OnRepFn = FindObject<UFunction>(L"/Script/FortniteGame.FortGameState.OnRep_AdditionalPlaylistLevelsStreamed");
-
-				if (OnRepFn)
-					GameState->ProcessEvent(OnRepFn);
+				LOG_WARN(LogCreative, "Waiting for the creative hub: no streaming level exists for {} after {} s, requesting it again (attempt {})", Name.ToString(), (int)(Waited / 1000), Requests);
+				GameState->AddToAdditionalPlaylistLevelsStreamed(Name);
 			}
+
+			if (Missing.empty())
+				LOG_INFO(LogCreative, "Waiting for the creative hub: every playlist level has a streaming level after {} s, none is requested again", (int)(Waited / 1000));
 		}
 	}
 }
@@ -517,6 +606,7 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 		LastNum2 = AmountOfRestarts;
 
 		LOG_INFO(LogDev, "Presetup!");
+		LOG_INFO(LogDev, "Presetup runs in world {}", GetWorld() ? GetWorld()->GetName() : std::string("none"));
 
 		/*
 
