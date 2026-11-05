@@ -53,17 +53,27 @@ static inline void LogCreativeProcessEvent(UObject* Object, UFunction* Function)
 // volume it spawned still has to stream the playset in, which nothing does on this server.
 static inline void CreativeAfterProcessEvent(UObject* Object, UFunction* Function, void* Parameters)
 {
+	// ProcessEvent is called from more than one thread, so the table is locked. It is released before anything is loaded.
 	static std::unordered_map<UFunction*, bool> IsPrefabLoadedCallback;
+	static std::mutex Lock;
 
-	auto Found = IsPrefabLoadedCallback.find(Function);
+	bool bPrefabLoaded = false;
 
-	if (Found == IsPrefabLoadedCallback.end())
 	{
-		const auto FullName = Function->GetFullName();
-		Found = IsPrefabLoadedCallback.emplace(Function, FullName.find("PlaysetGrenade") != std::string::npos && FullName.find(":OnLoaded_") != std::string::npos).first;
+		std::lock_guard<std::mutex> guard(Lock);
+
+		auto Found = IsPrefabLoadedCallback.find(Function);
+
+		if (Found == IsPrefabLoadedCallback.end())
+		{
+			const auto FullName = Function->GetFullName();
+			Found = IsPrefabLoadedCallback.emplace(Function, FullName.find("PlaysetGrenade") != std::string::npos && FullName.find(":OnLoaded_") != std::string::npos).first;
+		}
+
+		bPrefabLoaded = Found->second;
 	}
 
-	if (Found->second)
+	if (bPrefabLoaded)
 		CreativeIsland::LoadThrownPrefab(Object, Parameters ? *(UObject**)Parameters : nullptr);
 }
 

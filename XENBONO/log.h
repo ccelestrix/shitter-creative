@@ -171,8 +171,9 @@ namespace ForceLog
     {
         const DWORD code = info->ExceptionRecord->ExceptionCode;
 
-        const bool bFatal = code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_STACK_OVERFLOW || code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_INT_DIVIDE_BY_ZERO
-            || code == EXCEPTION_IN_PAGE_ERROR || code == EXCEPTION_PRIV_INSTRUCTION || code == EXCEPTION_ARRAY_BOUNDS_EXCEEDED || code == 0xC0000374 /* heap corruption */;
+        // Every error-severity code (0xC000xxxx: access violation, stack overflow, heap corruption, fast fail, ...). 0xC0000008 and 0xC0000024
+        // are raised on purpose by the system/debugger paths and are skipped.
+        const bool bFatal = (code & 0xF0000000) == 0xC0000000 && code != 0xC0000008 && code != 0xC0000024;
 
         if (!bFatal)
             return EXCEPTION_CONTINUE_SEARCH;
