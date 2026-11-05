@@ -1643,7 +1643,7 @@ void AFortGameModeAthena::Athena_HandleStartingNewPlayerHook(AFortGameModeAthena
 	}
 
 	// Island setup runs with the Creative tick box, and also when the creative playlist is played on the normal map (what 12.41 does by default).
-	if ((Globals::bCreative || PlaylistName.contains("/Creative/Playlist_Playground")) && ([&]() {
+	if (IsCreativeGame() && ([&]() {
 			static auto ManagerOffset = GameState->GetOffset("CreativePortalManager");
 
 			if (GameState->Get(ManagerOffset))
@@ -1817,6 +1817,7 @@ void AFortGameModeAthena::Athena_HandleStartingNewPlayerHook(AFortGameModeAthena
 			// Now the island is loaded, tell the clients (the loading screen and the island appearing both come from these).
 			CreativeIsland::CallOnRep(Portal->GetLinkedVolume(), "OnRep_VolumeState");
 			CreativeIsland::CallOnRep(NewPlayer, "OnRep_CreativePlotLinkedVolume");
+			CreativeIsland::SetupSettingsMachine(Portal->GetLinkedVolume());
 
 			LOG_INFO(LogCreative, "Initialized player portal!");
 		}

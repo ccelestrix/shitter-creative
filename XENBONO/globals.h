@@ -44,3 +44,9 @@ extern inline std::string PlaylistName =
 // "/Game/Athena/Playlists/Ashton/Playlist_Ashton_Sm.Playlist_Ashton_Sm";
 // "/Game/Athena/Playlists/BattleLab/Playlist_BattleLab.Playlist_BattleLab";
 // "/MoleGame/Playlists/Playlist_MoleGame.Playlist_MoleGame"; // very experimental dont use
+
+// True for the Creative tick box and also when the creative playlist is played on the normal map (what 12.41 does by default).
+static inline bool IsCreativeGame()
+{
+	return Globals::bCreative || PlaylistName.contains("/Creative/Playlist_Playground");
+}
