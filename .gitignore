@@ -361,22 +361,22 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
-.vs/Project Reboot 3.0/v17/Browse.VC.db
-.vs/Project Reboot 3.0/v17/.suo
-.vs/Project Reboot 3.0/v17/fileList.bin
-.vs/Project Reboot 3.0/v17/ipch/AutoPCH/389a1fa1f6dcd16f/DLLMAIN.ipch
-.vs/Project Reboot 3.0/v17/ipch/AutoPCH/6b05e7771d6ded15/UTIL.ipch
-Project Reboot 3.0/x64/Release/Project Reboot 3.0.tlog/CL.read.1.tlog
-Project Reboot 3.0/x64/Release/Project Reboot 3.0.tlog/link.read.1.tlog
-Project Reboot 3.0/x64/Release/Project Reboot 3.0.tlog/CL.write.1.tlog
-Project Reboot 3.0e/x64/Release/vc143.pdb
-x64/Release/Project Reboot 3.0.pdb
-Project Reboot 3.0/x64/Release/Project Reboot 3.0.log
-Project Reboot 3.0/x64/Release/Project Reboot 3.0.ipdb
-Project Reboot 3.0/x64/Release/Project Reboot 3.0.iobj
-.vs/Project Reboot 3.0/v17/Browse.VC.db
-.vs/Project Reboot 3.0/v17/.suo
-.vs/Project Reboot 3.0/v17/.suo
+.vs/XENBONO/v17/Browse.VC.db
+.vs/XENBONO/v17/.suo
+.vs/XENBONO/v17/fileList.bin
+.vs/XENBONO/v17/ipch/AutoPCH/389a1fa1f6dcd16f/DLLMAIN.ipch
+.vs/XENBONO/v17/ipch/AutoPCH/6b05e7771d6ded15/UTIL.ipch
+XENBONO/x64/Release/XENBONO.tlog/CL.read.1.tlog
+XENBONO/x64/Release/XENBONO.tlog/link.read.1.tlog
+XENBONO/x64/Release/XENBONO.tlog/CL.write.1.tlog
+XENBONOe/x64/Release/vc143.pdb
+x64/Release/XENBONO.pdb
+XENBONO/x64/Release/XENBONO.log
+XENBONO/x64/Release/XENBONO.ipdb
+XENBONO/x64/Release/XENBONO.iobj
+.vs/XENBONO/v17/Browse.VC.db
+.vs/XENBONO/v17/.suo
+.vs/XENBONO/v17/.suo
 *.db
 *.bin
 *.ipch
@@ -386,3 +386,7 @@ Project Reboot 3.0/x64/Release/Project Reboot 3.0.iobj
 *.ifc
 *.pdb
 Build/
+
+# XENBONO logs
+xenbono.log
+xenbono_creative.log

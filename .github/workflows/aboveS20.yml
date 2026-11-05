@@ -29,7 +29,7 @@ jobs:
         run: |
           git checkout master
           git checkout -b aboveS20
-          echo '#define ABOVE_S20' | cat - "./Project Reboot 3.0/inc.h" > temp && mv temp "./Project Reboot 3.0/inc.h"
-          git add "./Project Reboot 3.0/inc.h"
+          echo '#define ABOVE_S20' | cat - "./XENBONO/inc.h" > temp && mv temp "./XENBONO/inc.h"
+          git add "./XENBONO/inc.h"
           git commit -m "Add #define ABOVE_S20 to inc.h in aboveS20 branch"
           git push origin aboveS20

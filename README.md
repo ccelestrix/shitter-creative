@@ -6,7 +6,7 @@ It is a fork of [Project Reboot 3.0](https://github.com/Milxnor/Project-Reboot-3
 
 ## Build
 
-1. Open `Project Reboot 3.0.sln` in Visual Studio (2022 or newer, x64, Release).
+1. Open `XENBONO.sln` in Visual Studio (2022 or newer, x64, Release).
 2. Build. The output is `XENBONO.dll`.
 3. Inject it into the matching Fortnite client when starting the game server.
 
