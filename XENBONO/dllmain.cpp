@@ -1646,13 +1646,6 @@ DWORD WINAPI Main(LPVOID)
 
     CreativeIsland::HookControllerFunctions();
 
-    if (IsCreativeGame() && !bProcessEventHooked)
-    {
-        UObject::ProcessEventOriginal = decltype(UObject::ProcessEventOriginal)(Addresses::ProcessEvent);
-        bProcessEventHooked = Hooking::MinHook::Hook((PVOID)Addresses::ProcessEvent, ProcessEventHook, (PVOID*)&UObject::ProcessEventOriginal);
-        LOG_INFO(LogCreative, "Creative ProcessEvent logging: {}", bProcessEventHooked ? "on" : "FAILED to hook");
-    }
-
     LOG_INFO(LogCreative, "XENBONO Creative report: Fortnite {} (engine {}), creative mode {}", Fortnite_Version, Engine_Version, Globals::bCreative);
     LOG_INFO(LogCreative, "Creative playlist: {}", FindObject<UObject>(L"/Game/Athena/Playlists/Creative/Playlist_PlaygroundV2.Playlist_PlaygroundV2") ? "found" : "NOT FOUND");
     LOG_INFO(LogCreative, "Default__FortAthenaCreativePortal: {}", FortAthenaCreativePortalDefault ? "found" : "NOT FOUND");
@@ -1851,6 +1844,14 @@ DWORD WINAPI Main(LPVOID)
     }
 
     srand(time(0));
+
+    // Hooked last: MinHook pauses every other thread while it patches, so a hook that takes locks must not be running during the startup hooks above.
+    if (IsCreativeGame() && !bProcessEventHooked)
+    {
+        UObject::ProcessEventOriginal = decltype(UObject::ProcessEventOriginal)(Addresses::ProcessEvent);
+        bProcessEventHooked = Hooking::MinHook::Hook((PVOID)Addresses::ProcessEvent, ProcessEventHook, (PVOID*)&UObject::ProcessEventOriginal);
+        LOG_INFO(LogCreative, "Creative ProcessEvent logging: {}", bProcessEventHooked ? "on" : "FAILED to hook");
+    }
 
     LOG_INFO(LogHook, "Finished initialization!");
 
