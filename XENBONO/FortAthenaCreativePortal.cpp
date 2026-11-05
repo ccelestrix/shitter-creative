@@ -8,6 +8,7 @@
 #include "hooking.h"
 #include "GameplayStatics.h"
 #include <map>
+#include <set>
 
 void AFortAthenaCreativePortal::TeleportPlayerToLinkedVolumeHook(UObject* Context, FFrame& Stack, void* Ret)
 {
@@ -509,4 +510,59 @@ void CreativeIsland::DumpState(const std::string& Reason, int MaxTimes)
 
 	Controllers.Free();
 	LOG_INFO(LogCreative, "======== end of creative state ========");
+}
+
+void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedPlayset)
+{
+	auto Playset = (UFortPlaysetItemDefinition*)LoadedPlayset;
+
+	if (!Playset && Projectile)
+	{
+		static auto CachedPlaysetOffset = Projectile->GetOffset("CachedPlayset", false);
+
+		if (CachedPlaysetOffset != -1)
+			Playset = Projectile->Get<UFortPlaysetItemDefinition*>(CachedPlaysetOffset);
+	}
+
+	LOG_INFO(LogCreative, "Thrown prefab: projectile {} loaded playset {}", Describe(Projectile), Describe(Playset));
+
+	if (!Playset)
+	{
+		LOG_WARN(LogCreative, "Thrown prefab: no playset to load");
+		return;
+	}
+
+	static auto VolumeClass = FindObject<UClass>(L"/Script/FortniteGame.FortVolume");
+
+	if (!VolumeClass)
+		return;
+
+	static std::set<std::string> AlreadyLoaded; // by name, an address can be reused by a later volume
+
+	auto Volumes = UGameplayStatics::GetAllActorsOfClass(GetWorld(), VolumeClass);
+	int Loaded = 0;
+
+	for (int i = 0; i < Volumes.Num(); ++i)
+	{
+		auto Volume = (AFortVolume*)Volumes.at(i);
+
+		if (!Volume)
+			continue;
+
+		const auto Name = Volume->GetName();
+
+		if (Name.find("PrefabGrenades") == std::string::npos || AlreadyLoaded.contains(Name))
+			continue;
+
+		AlreadyLoaded.insert(Name);
+		LOG_INFO(LogCreative, "Thrown prefab: loading {} into {} at {}", Playset->GetName(), Name, Where(Volume));
+		UFortPlaysetItemDefinition::ShowPlayset(Playset, Volume);
+		CallOnRep(Volume, "OnRep_VolumeState");
+		++Loaded;
+	}
+
+	Volumes.Free();
+
+	if (!Loaded)
+		LOG_WARN(LogCreative, "Thrown prefab: no new prefab volume was found to load the playset into");
 }

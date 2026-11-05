@@ -970,7 +970,8 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 
 	auto MatDefinition = UFortKismetLibrary::K2_GetResourceItemDefinition(BuildingActor->GetResourceType());
 
-	bool bBuildFree = PlayerController->DoesBuildFree();
+	// In Creative building costs nothing (the player has infinite resources as a setting, not as items), so it is never refused for materials.
+	bool bBuildFree = PlayerController->DoesBuildFree() || IsCreativeGame();
 
 	// LOG_INFO(LogDev, "MatInstance->GetItemEntry()->GetCount(): {}", MatInstance->GetItemEntry()->GetCount());
 	

@@ -6,6 +6,8 @@
 #include <mutex>
 #include <unordered_map>
 
+#include "FortAthenaCreativePortal.h"
+
 extern inline void (*SetZoneToIndexOriginal)(AFortGameModeAthena* GameModeAthena, int OverridePhaseMaybeIDFK) = nullptr;
 
 void SetZoneToIndexHook(AFortGameModeAthena* GameModeAthena, int OverridePhaseMaybeIDFK);
@@ -34,7 +36,7 @@ static inline void LogCreativeProcessEvent(UObject* Object, UFunction* Function)
 		const bool bServerRequest = Has(":Server") && !Has("ServerMove") && !Has("ServerUpdate") && !Has("ServerTouch") && !Has("ServerAck") && !Has("ServerCheckClient") && !Has("ServerSetSpectator")
 			&& !Has("ServerSendClient") && !Has("ServerNotifyLoaded") && !Has("ServerSetClientTimeStamp") && !Has("ServerCamera") && !Has("ServerRotate") && !Has("ServerPawn");
 
-		const bool bInteresting = bServerRequest || Has("Projectile") || Has("Explod") || Has("Detonat") || (Has("Playset") || Has("Volume") || Has("Grenade") || Has("Minigame") || Has("Creative") || Has("Prefab") || Has("Plot") || Has("Island") || Has("Thermometer") || Has("Throw") || Has("Building:") || Has("BuildingSMActor") || Has("BuildingActor"))
+		const bool bInteresting = bServerRequest || Has("Projectile") || Has("Explod") || Has("Detonat") || (Has("Playset") || Has("Volume") || Has("Grenade") || Has("Minigame") || Has("Creative") || Has("Prefab") || Has("Plot") || Has("Island") || Has("Playspace") || Has("Thermometer") || Has("Throw") || Has("Building:") || Has("BuildingSMActor") || Has("BuildingActor"))
 			&& !Has("Audio") && !Has("Sound") && !Has("Submix") && !Has("PostProcess") && !Has("Physics") && !Has("LevelStreamingVolume") && !Has("Tick") && !Has("Animation") && !Has("Anim");
 
 		Found = CallsLeft.emplace(Function, bInteresting ? 40 : -1).first;
@@ -45,6 +47,24 @@ static inline void LogCreativeProcessEvent(UObject* Object, UFunction* Function)
 
 	Found->second--;
 	LOG_INFO(LogCreative, "ProcessEvent {} on {}", Function->GetFullName(), Object->GetName());
+}
+
+// Runs after a blueprint function has run. In Creative, when a thrown prefab/gallery grenade has loaded its playset (OnLoaded_...), the
+// volume it spawned still has to stream the playset in, which nothing does on this server.
+static inline void CreativeAfterProcessEvent(UObject* Object, UFunction* Function, void* Parameters)
+{
+	static std::unordered_map<UFunction*, bool> IsPrefabLoadedCallback;
+
+	auto Found = IsPrefabLoadedCallback.find(Function);
+
+	if (Found == IsPrefabLoadedCallback.end())
+	{
+		const auto FullName = Function->GetFullName();
+		Found = IsPrefabLoadedCallback.emplace(Function, FullName.find("PlaysetGrenade") != std::string::npos && FullName.find(":OnLoaded_") != std::string::npos).first;
+	}
+
+	if (Found->second)
+		CreativeIsland::LoadThrownPrefab(Object, Parameters ? *(UObject**)Parameters : nullptr);
 }
 
 static inline void ProcessEventHook(UObject* Object, UFunction* Function, void* Parameters)
@@ -203,5 +223,8 @@ static inline void ProcessEventHook(UObject* Object, UFunction* Function, void* 
 		}
 	}
 
-	return Object->ProcessEvent(Function, Parameters);
+	Object->ProcessEvent(Function, Parameters);
+
+	if (IsCreativeGame())
+		CreativeAfterProcessEvent(Object, Function, Parameters);
 }
