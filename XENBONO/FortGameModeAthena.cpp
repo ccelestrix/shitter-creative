@@ -1642,7 +1642,8 @@ void AFortGameModeAthena::Athena_HandleStartingNewPlayerHook(AFortGameModeAthena
 		PlayerCameraManager->Get<float>(ViewRollMaxOffset) = 0;
 	}
 
-	if (Globals::bCreative && ([&]() {
+	// Island setup runs with the Creative tick box, and also when the creative playlist is played on the normal map (what 12.41 does by default).
+	if ((Globals::bCreative || PlaylistName.contains("/Creative/Playlist_Playground")) && ([&]() {
 			static auto ManagerOffset = GameState->GetOffset("CreativePortalManager");
 
 			if (GameState->Get(ManagerOffset))

@@ -1504,8 +1504,8 @@ static inline void PregameUI()
 {
 	StaticUI();
 
-	// 4.22-4.23 (S9-S10) and 4.24 (11.x-12.x, includes 12.41) have the creative hub.
-	if (Engine_Version >= 422 && Engine_Version <= 424)
+	// 4.22-4.23 (S9-S10) have the creative hub map; 4.24-4.25 (11.x-12.x, 12.41 is 4.25) can tick it too.
+	if (Engine_Version >= 422 && Engine_Version <= 425)
 	{
 		ImGui::Checkbox("Creative", &Globals::bCreative);
 	}

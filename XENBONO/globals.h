@@ -6,7 +6,7 @@
 
 namespace Globals
 {
-	extern inline bool bCreative = true; // XENBONO defaults to Creative (see PlaylistName)
+	extern inline bool bCreative = false; // the Creative tick box: opens the creative hub map. Off by default, 12.41 runs the creative playlist on the normal map.
 	extern inline bool bGoingToPlayEvent = false;
 	extern inline bool bEnableAGIDs = true;
 	extern inline bool bNoMCP = true;
