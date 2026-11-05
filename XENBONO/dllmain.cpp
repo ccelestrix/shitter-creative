@@ -1865,6 +1865,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID lpReserved)
     switch (reason)
     {
     case DLL_PROCESS_ATTACH:
+        ForceLog::Start(); // the log files exist from the moment the DLL is loaded
+        ForceLog::InstallCrashLogging();
+        LOG_INFO(LogInit, "XENBONO.dll attached, starting the server thread");
         CreateThread(0, 0, Main, 0, 0, 0);
         break;
     case DLL_PROCESS_DETACH:

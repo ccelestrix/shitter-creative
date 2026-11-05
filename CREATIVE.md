@@ -17,5 +17,5 @@ None of this has been run against a 12.41 client. To find what breaks next, star
 - Saving and loading island contents is not implemented.
 
 ## Logs
-- `xenbono.log`: everything the server logs.
+- `xenbono.log`: every line from every logger, written straight to disk in the game's working directory (falls back to the exe folder, the DLL folder, then temp if that folder is not writable). The first line says which folder was used.
 - `xenbono_creative.log`: only the Creative lines (`LogCreative`), written next to the game executable. It starts with a report of which Creative functions and addresses were found, then logs island setup, the hub teleport, portal teleports and creative item requests.
