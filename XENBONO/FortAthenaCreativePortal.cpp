@@ -763,6 +763,16 @@ void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 			LOG_INFO(LogCreative, "Thrown prefab: streamed the playset into {}", Name);
 		}
 
+		// Step 2b (own tick box): the island setup marks its volume Ready and tells the clients, and a client loads a playset into a volume that is Ready.
+		if (Globals::bPrefabMarkReady)
+		{
+			LOG_INFO(LogCreative, "Thrown prefab: marking {} Ready (it is in state {})", Name, (int)Volume->GetVolumeState());
+			Volume->GetVolumeState() = EVolumeState::Ready;
+			CallOnRep(Volume, "OnRep_VolumeState");
+			CallOnRep(Volume, "OnRep_CurrentPlayset");
+			LOG_INFO(LogCreative, "Thrown prefab: {} is now in state {}, stream component {}", Name, (int)Volume->GetVolumeState(), HasStream() ? "present" : "missing");
+		}
+
 		// Step 3: the volume manager's queue, as the game does when a volume is waiting.
 
 		// The prefab volume has no stream component of its own and starts Uninitialized (0): the game activates such volumes from the volume manager's
@@ -958,7 +968,9 @@ namespace CreativeMinigame
 		ULONGLONG Since = 0;
 		ULONGLONG LastDriven = 0;
 		bool bAdded = false;
-		bool bTeleported = false;
+		bool bPossessed = false;
+		bool bCameras = false;
+		bool bStartedHandled = false;
 		bool bAdvanced = false;
 		bool bLimitCalled = false;
 		bool bEndCalled = false;
@@ -1042,7 +1054,15 @@ namespace CreativeMinigame
 		if (NewState == Warmup)
 			Call(Minigame, "HandleMinigameWarmup");
 		else if (NewState == InProgress)
-			Call(Minigame, "HandleMinigameStarted");
+		{
+			auto& D = Drivers[Minigame];
+
+			if (!D.bStartedHandled)
+			{
+				D.bStartedHandled = true;
+				Call(Minigame, "HandleMinigameStarted");
+			}
+		}
 		else if (NewState == PostGameEnd || NewState == PostRoundEnd)
 			Call(Minigame, "HandleMinigameEnded");
 	}
@@ -1111,6 +1131,56 @@ namespace CreativeMinigame
 		return Best;
 	}
 
+	// What Xenon's FortMinigame.cpp does when the island's minigame reaches these states (the game's own server code for it is missing here):
+	// each participant gets a team (3 and up) and the "pawn possessed during transition" call.
+	static void PossessDuringTransition(UObject* Minigame, const std::vector<AFortPlayerControllerAthena*>& Players, bool bSetTeams)
+	{
+		int Index = 0;
+
+		for (auto Player : Players)
+		{
+			auto Pawn = Player->GetMyFortPawn();
+
+			if (bSetTeams)
+			{
+				uint8_t Team = (uint8_t)(3 + Index);
+				Call(Player, "ServerSetTeam", &Team);
+				LOG_INFO(LogCreative, "Minigame driver: {} is on team {}", Describe(Player), (int)Team);
+			}
+
+			++Index;
+
+			if (!Pawn)
+			{
+				LOG_WARN(LogCreative, "Minigame driver: {} has no pawn for the transition", Describe(Player));
+				continue;
+			}
+
+			const auto Before = Pawn->GetActorLocation();
+			struct { UObject* Pawn; } Params{ Pawn };
+			Call(Minigame, "OnPlayerPawnPossessedDuringTransition", &Params);
+			const auto After = Pawn->GetActorLocation();
+			const double dx = (double)After.X - (double)Before.X, dy = (double)After.Y - (double)Before.Y, dz = (double)After.Z - (double)Before.Z;
+			const bool bMoved = dx * dx + dy * dy + dz * dz > 100.0 * 100.0;
+
+			LOG_INFO(LogCreative, "Minigame driver: OnPlayerPawnPossessedDuringTransition for {}: the pawn {} ({} -> {})", Describe(Pawn), bMoved ? "was moved by the game" : "was not moved", Where(Pawn), "now");
+
+			// If the game left the pawn where it was and the island has a Player Start plate, the pawn goes to the plate.
+			if (!bMoved)
+			{
+				if (auto Plate = NearestStartPlate(Pawn))
+				{
+					auto Location = Plate->GetActorLocation();
+					Location.Z += 150;
+					Pawn->TeleportTo(Location, Pawn->GetActorRotation());
+					LOG_INFO(LogCreative, "Minigame driver: moved {} to the player start plate {} at {}", Describe(Pawn), Plate->GetName(), Where(Plate));
+				}
+				else
+					LOG_INFO(LogCreative, "Minigame driver: the island has no player start plate, {} stays where it is", Describe(Pawn));
+			}
+		}
+	}
+
 	void NoteGameThread()
 	{
 		GameThreadId = GetCurrentThreadId();
@@ -1154,9 +1224,11 @@ namespace CreativeMinigame
 			D.Since = Now;
 			D.bAdvanced = false;
 
-			if (State == Transitioning) { D.bAdded = false; D.bTeleported = false; }
+			if (State == Transitioning) { D.bAdded = false; D.bPossessed = false; D.bStartedHandled = false; }
+			if (State == WaitingForCameras) D.bCameras = false;
 			if (State == InProgress) { D.bLimitCalled = false; D.bEndCalled = false; }
 			if (State == PostGameReset) D.bResetDone = false;
+			if (State == PreGame) D.bStartedHandled = false;
 		}
 
 		const ULONGLONG Elapsed = Now - D.Since;
@@ -1192,65 +1264,83 @@ namespace CreativeMinigame
 
 		case Transitioning:
 		{
-			// 1. everyone in the island is a participant
+			// 1. everyone in the island is a participant (the game's list is asked first)
 			if (Elapsed > 600 && !D.bAdded)
 			{
 				D.bAdded = true;
 
+				struct { TArray<UObject*> Out; } Participants{};
+				Call(Minigame, "GetParticipatingPlayers", &Participants);
+				LOG_INFO(LogCreative, "Minigame driver: the game lists {} participating players, {} players are on the island", Participants.Out.Num(), (int)Players.size());
+
 				for (auto Player : Players)
 				{
 					auto PlayerState = Player->GetPlayerState();
-					struct { UObject* PlayerState; bool bCheckSpectating; bool ReturnValue; } InGame{ PlayerState, false, false };
+					bool bListed = false;
 
-					if (Call(Minigame, "IsPlayerInMinigame", &InGame) && InGame.ReturnValue)
-					{
-						LOG_INFO(LogCreative, "Minigame driver: {} is already a participant", Describe(PlayerState));
+					for (int i = 0; i < Participants.Out.Num(); ++i)
+						bListed = bListed || Participants.Out.at(i) == PlayerState;
+
+					if (bListed)
 						continue;
-					}
 
 					struct { UObject* PlayerState; bool bForceSpawn; } Add{ PlayerState, true };
 					Call(Minigame, "AddMinigamePlayer", &Add);
 					LOG_INFO(LogCreative, "Minigame driver: added {} as a participant", Describe(PlayerState));
 				}
+
+				Participants.Out.Free();
 			}
 
-			// 2. they are moved to a Player Start plate if there is one (otherwise they stay where they are)
-			if (Elapsed > 1200 && !D.bTeleported)
+			// 2. teams, and the pawns possessed for the transition
+			if (Elapsed > 1200 && !D.bPossessed)
 			{
-				D.bTeleported = true;
+				D.bPossessed = true;
+				PossessDuringTransition(Minigame, Players, true);
+			}
 
-				for (auto Player : Players)
+			// 3. on to the next state, then the minigame's start handler (the order Xenon uses)
+			if (Elapsed > 1800 && !D.bAdvanced)
+			{
+				D.bAdvanced = true;
+				Advance(Minigame, "Transitioning");
+
+				if (!D.bStartedHandled)
 				{
-					auto Pawn = Player->GetMyFortPawn();
-
-					if (!Pawn)
-						continue;
-
-					if (auto Plate = NearestStartPlate(Pawn))
-					{
-						auto Location = Plate->GetActorLocation();
-						Location.Z += 150;
-						Pawn->TeleportTo(Location, Pawn->GetActorRotation());
-						LOG_INFO(LogCreative, "Minigame driver: moved {} to the player start plate {} at {}", Describe(Pawn), Plate->GetName(), Where(Plate));
-					}
-					else
-						LOG_INFO(LogCreative, "Minigame driver: the island has no player start plate, {} stays where it is", Describe(Pawn));
-
-					struct { UObject* Pawn; } Finished{ Pawn };
-					Call(Minigame, "OnClientFinishTeleportingForMinigame", &Finished);
+					D.bStartedHandled = true;
+					Call(Minigame, "HandleMinigameStarted");
+					LOG_INFO(LogCreative, "Minigame driver: HandleMinigameStarted called, state {}", NameOf(StateOf(Minigame)));
 				}
 			}
 
-			// 3. on to the next state
-			if (Elapsed > 2000 && !D.bAdvanced) { D.bAdvanced = true; Advance(Minigame, "Transitioning"); }
-			if (Elapsed > 4000) ForceState(Minigame, Warmup, "Transitioning never ended");
+			if (Elapsed > 4500)
+				ForceState(Minigame, Warmup, "Transitioning never ended");
+
 			break;
 		}
 
 		case WaitingForCameras:
-			if (Elapsed > 1000 && !D.bAdvanced) { D.bAdvanced = true; Advance(Minigame, "WaitingForCameras"); }
-			if (Elapsed > 3000) ForceState(Minigame, Warmup, "WaitingForCameras never ended");
+		{
+			// the clients are told their pawns finished teleporting, then the state moves on after a second (Xenon waits 1 s as well)
+			if (Elapsed > 300 && !D.bCameras)
+			{
+				D.bCameras = true;
+
+				for (auto Player : Players)
+				{
+					if (auto Pawn = Player->GetMyFortPawn())
+					{
+						struct { UObject* Pawn; } Finished{ Pawn };
+						Call(Minigame, "OnClientFinishTeleportingForMinigame", &Finished);
+						LOG_INFO(LogCreative, "Minigame driver: OnClientFinishTeleportingForMinigame for {}", Describe(Pawn));
+					}
+				}
+			}
+
+			if (Elapsed > 1300 && !D.bAdvanced) { D.bAdvanced = true; Advance(Minigame, "WaitingForCameras"); }
+			if (Elapsed > 4000) ForceState(Minigame, Warmup, "WaitingForCameras never ended");
 			break;
+		}
 
 		case Warmup:
 		{
@@ -1307,7 +1397,7 @@ namespace CreativeMinigame
 			if (!D.bResetDone)
 			{
 				D.bResetDone = true;
-				Call(Minigame, "PostGameResetPlayers");
+				PossessDuringTransition(Minigame, Players, false);
 
 				if (auto VolumeManager = Manager())
 				{
@@ -1315,7 +1405,7 @@ namespace CreativeMinigame
 					Call(VolumeManager, "MinigameExitReadOnlyForVolume", &Params);
 				}
 
-				LOG_INFO(LogCreative, "Minigame driver: players reset, island volume is now state {}", (int)Volume->GetVolumeState());
+				LOG_INFO(LogCreative, "Minigame driver: players put back, island volume is now state {}", (int)Volume->GetVolumeState());
 			}
 
 			if (Elapsed > 1500)
