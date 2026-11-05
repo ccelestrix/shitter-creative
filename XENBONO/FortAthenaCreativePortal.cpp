@@ -478,6 +478,35 @@ void CreativeIsland::DumpState(const std::string& Reason, int MaxTimes)
 		auto LinkedVolume = Controller->GetCreativePlotLinkedVolume();
 		DumpVolume("CreativePlotLinkedVolume", LinkedVolume);
 
+		// The minigame that belongs to this island: its state decides what Start Game can do.
+		static auto VolumeManagerDefault = FindObject<UObject>(L"/Script/FortniteGame.Default__FortVolumeManager");
+
+		if (VolumeManagerDefault && LinkedVolume)
+		{
+			if (auto GetMinigameFn = VolumeManagerDefault->FindFunction("GetMinigameForVolume"))
+			{
+				struct { AFortVolume* Volume; UObject* ReturnValue; } Params{ LinkedVolume, nullptr };
+				VolumeManagerDefault->ProcessEvent(GetMinigameFn, &Params);
+				auto Minigame = Params.ReturnValue;
+
+				static const char* StateNames[] = { "PreGame", "Setup", "Transitioning", "WaitingForCameras", "Warmup", "InProgress", "PostGameTimeDilation", "PostRoundEnd", "PostGameEnd", "PostGameAbandon", "PostGameReset" };
+
+				if (Minigame)
+				{
+					static auto CurrentStateOffset = Minigame->GetOffset("CurrentState", false);
+					static auto PreviousStateOffset = Minigame->GetOffset("PreviousState", false);
+					static auto AutoStartDelayOffset = Minigame->GetOffset("AutoStartDelay", false);
+
+					const int Current = CurrentStateOffset == -1 ? -1 : (int)Minigame->Get<uint8_t>(CurrentStateOffset);
+					const int Previous = PreviousStateOffset == -1 ? -1 : (int)Minigame->Get<uint8_t>(PreviousStateOffset);
+
+					LOG_INFO(LogCreative, "  island minigame {}: state {} ({}), previous {}, AutoStartDelay {}", Describe(Minigame), Current, Current >= 0 && Current <= 10 ? StateNames[Current] : "?", Previous, AutoStartDelayOffset == -1 ? -1 : Minigame->Get<int>(AutoStartDelayOffset));
+				}
+				else
+					LOG_WARN(LogCreative, "  GetMinigameForVolume found no minigame for the island volume");
+			}
+		}
+
 		// The game's own answers about this player and island.
 		if (auto OwnsFn = Controller->FindFunction("OwnsIslandVolume"))
 		{
@@ -537,6 +566,33 @@ void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 	if (!Globals::bLoadThrownPrefabs)
 	{
 		LOG_INFO(LogCreative, "Thrown prefab: projectile {} loaded {} (playset: {}); loading thrown prefabs is off, so nothing is streamed in", Describe(Projectile), Describe(LoadedAsset), Describe(Playset));
+
+		// What the game itself put in the volume it spawned, to see which part is missing.
+		static auto OffVolumeClass = FindObject<UClass>(L"/Script/FortniteGame.FortVolume");
+		static auto OffStreamClass = FindObject<UClass>("/Script/FortniteGame.PlaysetLevelStreamComponent");
+
+		if (OffVolumeClass)
+		{
+			auto Volumes = UGameplayStatics::GetAllActorsOfClass(GetWorld(), OffVolumeClass);
+
+			for (int i = 0; i < Volumes.Num(); ++i)
+			{
+				auto Volume = (AFortVolume*)Volumes.at(i);
+
+				if (!Volume || Volume->GetName().find("PrefabGrenades") == std::string::npos)
+					continue;
+
+				static auto VolumePlaysetOffset = Volume->GetOffset("CurrentPlayset", false);
+				auto Stream = OffStreamClass ? (UObject*)Volume->GetComponentByClass(OffStreamClass) : nullptr;
+				static auto StreamPlaysetOffset = Stream ? Stream->GetOffset("CurrentPlayset", false) : -1;
+
+				LOG_INFO(LogCreative, "  prefab volume {} at {}: state {}, volume playset {}, stream component {}, stream playset {}", Volume->GetName(), Where(Volume), (int)Volume->GetVolumeState(),
+					Describe(VolumePlaysetOffset == -1 ? nullptr : Volume->Get<UObject*>(VolumePlaysetOffset)), Describe(Stream), Describe(Stream && StreamPlaysetOffset != -1 ? Stream->Get<UObject*>(StreamPlaysetOffset) : nullptr));
+			}
+
+			Volumes.Free();
+		}
+
 		return;
 	}
 
@@ -627,4 +683,45 @@ void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 
 	if (!Loaded)
 		LOG_WARN(LogCreative, "Thrown prefab: no new prefab volume was found to load the playset into");
+}
+
+void CreativeIsland::LogMinigameStates(const char* Why)
+{
+	static auto MinigameClass = FindObject<UClass>(L"/Script/FortniteGame.FortMinigame");
+
+	if (!MinigameClass)
+		return;
+
+	static const char* StateNames[] = { "PreGame", "Setup", "Transitioning", "WaitingForCameras", "Warmup", "InProgress", "PostGameTimeDilation", "PostRoundEnd", "PostGameEnd", "PostGameAbandon", "PostGameReset" };
+	static std::map<std::string, int> LastState;
+
+	auto Minigames = UGameplayStatics::GetAllActorsOfClass(GetWorld(), MinigameClass);
+
+	for (int i = 0; i < Minigames.Num(); ++i)
+	{
+		auto Minigame = Minigames.at(i);
+
+		if (!Minigame)
+			continue;
+
+		static auto CurrentStateOffset = Minigame->GetOffset("CurrentState", false);
+
+		if (CurrentStateOffset == -1)
+			continue;
+
+		const int State = (int)Minigame->Get<uint8_t>(CurrentStateOffset);
+		const auto Name = Minigame->GetName();
+		auto Found = LastState.find(Name);
+
+		if (Found == LastState.end())
+			Found = LastState.emplace(Name, 0).first; // everything starts in PreGame
+
+		if (Found->second == State)
+			continue;
+
+		LOG_INFO(LogCreative, "Minigame {} went from {} to {} ({})", Name, Found->second >= 0 && Found->second <= 10 ? StateNames[Found->second] : "?", State >= 0 && State <= 10 ? StateNames[State] : "?", Why);
+		Found->second = State;
+	}
+
+	Minigames.Free();
 }

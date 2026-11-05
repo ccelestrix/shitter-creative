@@ -101,4 +101,6 @@ namespace CreativeIsland
 	void DumpState(const std::string& Reason, int MaxTimes = 3);
 	/** A thrown prefab/gallery grenade has loaded its playset: stream it into the volume the grenade spawned. */
 	void LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset);
+	/** Writes the state of every minigame whose state changed since the last call (PreGame, Setup, ... InProgress). */
+	void LogMinigameStates(const char* Why);
 }

@@ -54,27 +54,31 @@ static inline void LogCreativeProcessEvent(UObject* Object, UFunction* Function)
 static inline void CreativeAfterProcessEvent(UObject* Object, UFunction* Function, void* Parameters)
 {
 	// ProcessEvent is called from more than one thread, so the table is locked. It is released before anything is loaded.
-	static std::unordered_map<UFunction*, bool> IsPrefabLoadedCallback;
+	static std::unordered_map<UFunction*, int> Kind; // 0 nothing, 1 a thrown prefab's OnLoaded callback, 2 a minigame state change
 	static std::mutex Lock;
 
-	bool bPrefabLoaded = false;
+	int Which = 0;
 
 	{
 		std::lock_guard<std::mutex> guard(Lock);
 
-		auto Found = IsPrefabLoadedCallback.find(Function);
+		auto Found = Kind.find(Function);
 
-		if (Found == IsPrefabLoadedCallback.end())
+		if (Found == Kind.end())
 		{
 			const auto FullName = Function->GetFullName();
-			Found = IsPrefabLoadedCallback.emplace(Function, FullName.find("PlaysetGrenade") != std::string::npos && FullName.find(":OnLoaded_") != std::string::npos).first;
+			const int Value = FullName.find("PlaysetGrenade") != std::string::npos && FullName.find(":OnLoaded_") != std::string::npos ? 1
+				: (FullName.find("HandleMinigameStateChanged") != std::string::npos || FullName.find("FortMinigame:OnGamePhaseChanged") != std::string::npos ? 2 : 0);
+			Found = Kind.emplace(Function, Value).first;
 		}
 
-		bPrefabLoaded = Found->second;
+		Which = Found->second;
 	}
 
-	if (bPrefabLoaded)
+	if (Which == 1)
 		CreativeIsland::LoadThrownPrefab(Object, Parameters ? *(UObject**)Parameters : nullptr);
+	else if (Which == 2)
+		CreativeIsland::LogMinigameStates(Function->GetName().c_str());
 }
 
 static inline void ProcessEventHook(UObject* Object, UFunction* Function, void* Parameters)
