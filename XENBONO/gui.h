@@ -330,6 +330,9 @@ static inline void StaticUI()
 	if (IsCreativeGame())
 		ImGui::Checkbox("Activate thrown prefab volumes (experimental)", &Globals::bLoadThrownPrefabs);
 
+	if (IsCreativeGame())
+		ImGui::Checkbox("Drive Start Game / End Game (the game's own flow stalls)", &Globals::bDriveMinigames);
+
 	if (IsRestartingSupported())
 	{
 		// ImGui::Checkbox("Auto Restart", &Globals::bAutoRestart);

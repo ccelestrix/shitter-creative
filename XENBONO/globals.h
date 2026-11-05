@@ -8,6 +8,8 @@ namespace Globals
 {
 	// Streams thrown prefabs/galleries into the volume the grenade spawns. Experimental: an earlier version of this crashed the server a few seconds after a throw. It is on again with a safer sequence that logs every step; untick it in the Game tab if the server dies.
 	extern inline bool bLoadThrownPrefabs = true;
+	// Moves a started island game along (Transitioning, Warmup, InProgress, post game). The game's own server code for this is missing here.
+	extern inline bool bDriveMinigames = true;
 	extern inline bool bCreative = false; // the Creative tick box: opens the creative hub map. Off by default, 12.41 runs the creative playlist on the normal map.
 	extern inline bool bGoingToPlayEvent = false;
 	extern inline bool bEnableAGIDs = true;

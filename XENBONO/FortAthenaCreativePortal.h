@@ -106,3 +106,15 @@ namespace CreativeIsland
 	/** Writes the island's creative budget (the "memory used" bar at the top): total and used per category. */
 	void LogBudget(const char* Why, int MaxTimes = 40);
 }
+
+// Start Game / End Game. The game's server-side minigame flow is missing from this executable: after Start the island's minigame stops in
+// Transitioning. This drives it forward step by step: the game's own function first, checked, and forced only if nothing happened.
+namespace CreativeMinigame
+{
+	/** Remembers the game thread (the driver only runs there). Called when an island is set up. */
+	void NoteGameThread();
+	/** Called often (from ProcessEvent); does something only a few times a second. */
+	void Tick();
+	/** The client pressed End Game (ServerEndMinigame). */
+	void NoteEndRequested(UObject* Controller);
+}

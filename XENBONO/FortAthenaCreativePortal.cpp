@@ -198,6 +198,8 @@ void CreativeIsland::SetupSettingsMachine(AFortVolume* Volume)
 	if (!Volume)
 		return;
 
+	CreativeMinigame::NoteGameThread();
+
 	static auto MachineClass = FindObject<UClass>(L"/Game/Athena/Items/Gameplay/MinigameSettingsControl/MinigameSettingsMachine.MinigameSettingsMachine_C");
 	static auto MinigameVolumeComponentClass = FindObject<UClass>(L"/Script/FortniteGame.FortMinigameVolumeComponent");
 	static auto CreativeLinkComponentClass = FindObject<UClass>(L"/Script/FortniteGame.FortCreativeVolumeLinkComponent");
@@ -282,7 +284,18 @@ XENBONO_CREATIVE_LOG_HOOK(ServerSetOnCreativePortalLoadedDelegate)
 XENBONO_CREATIVE_LOG_HOOK(ServerSetPlayset)
 // Start Game / End Game and the island portal.
 XENBONO_CREATIVE_DUMP_HOOK(ServerStartMinigame)
-XENBONO_CREATIVE_DUMP_HOOK(ServerEndMinigame)
+// End Game: also tell the minigame driver, which calls the game's EndGame if the game itself does nothing.
+static void (*ServerEndMinigameOriginal)(UObject*, FFrame&, void*) = nullptr;
+
+static void ServerEndMinigameHook(UObject* Context, FFrame& Stack, void* Ret)
+{
+	LOG_INFO(LogCreative, "Client called ServerEndMinigame on {}", Context ? Context->GetName() : std::string("null"));
+	CreativeIsland::DumpState("before ServerEndMinigame");
+	CreativeMinigame::NoteEndRequested(Context);
+	ServerEndMinigameOriginal(Context, Stack, Ret);
+	CreativeIsland::DumpState("after ServerEndMinigame");
+}
+
 XENBONO_CREATIVE_DUMP_HOOK(ServerRestartMinigame)
 XENBONO_CREATIVE_LOG_HOOK(ServerSetMinigameClassSlot)
 XENBONO_CREATIVE_LOG_HOOK(ServerToggleAutoRestartMinigame)
@@ -677,7 +690,61 @@ void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 		static auto PrefabStreamClass = FindObject<UClass>("/Script/FortniteGame.PlaysetLevelStreamComponent");
 		auto HasStream = [&]() -> bool { return PrefabStreamClass && Volume->GetComponentByClass(PrefabStreamClass) != nullptr; };
 
+		// What this playset is made of, so a prefab that does not work can be told apart from one that has nothing to place.
+		{
+			static auto WorldOffset = UsePlayset->GetOffset("PlaysetToSpawn", false);
+			static auto SaveRecordOffset = UsePlayset->GetOffset("LevelSaveRecord", false);
+			static auto CookedOffset = UsePlayset->GetOffset("bHasBeenCooked", false);
+			static auto SizeXOffset = UsePlayset->GetOffset("SizeX", false);
+			static auto PropsOffset = UsePlayset->GetOffset("AssociatedPlaysetProps", false);
+
+			std::string LevelPath = "n/a";
+
+			if (WorldOffset != -1)
+			{
+				auto& Soft = UsePlayset->Get<TSoftObjectPtr<UObject>>(WorldOffset);
+				LevelPath = Soft.IsValid() ? Soft.SoftObjectPtr.ObjectID.AssetPathName.ToString() : std::string("not set");
+			}
+
+			LOG_INFO(LogCreative, "Thrown prefab: playset {} streams level {}, level save record {}, cooked {}, size {} x {} x {}, {} associated props", UsePlayset->GetName(), LevelPath,
+				Describe(SaveRecordOffset == -1 ? nullptr : UsePlayset->Get<UObject*>(SaveRecordOffset)), CookedOffset == -1 ? -1 : (int)UsePlayset->Get<bool>(CookedOffset),
+				SizeXOffset == -1 ? -1 : UsePlayset->Get<int>(SizeXOffset), SizeXOffset == -1 ? -1 : UsePlayset->Get<int>(SizeXOffset + 4), SizeXOffset == -1 ? -1 : UsePlayset->Get<int>(SizeXOffset + 8),
+				PropsOffset == -1 ? -1 : *(int*)((char*)UsePlayset + PropsOffset + 8));
+		}
+
+		// Step 0: the playset's own function that spawns its actors around an actor (here the prefab volume). If the game's code for it is present, the
+		// actors are ordinary replicated actors and every client sees them. Judged by whether the number of actors in the world went up.
+		bool bStep0Spawned = false;
+		{
+			static auto PlaysetDefault = FindObject<UObject>(L"/Script/FortniteGame.Default__FortPlaysetItemDefinition");
+			const int Before = CountActors(L"/Script/Engine.Actor");
+
+			if (PlaysetDefault)
+			{
+				if (auto SpawnActorsFn = PlaysetDefault->FindFunction("SpawnActorsInPlayset"))
+				{
+					struct { AActor* WorldContextObject; UFortPlaysetItemDefinition* Playset; } Params{ Volume, UsePlayset };
+					LOG_INFO(LogCreative, "Thrown prefab: step 0, calling SpawnActorsInPlayset on {} ({} actors in the world)", Name, Before);
+					PlaysetDefault->ProcessEvent(SpawnActorsFn, &Params);
+					const int After = CountActors(L"/Script/Engine.Actor");
+					LOG_INFO(LogCreative, "Thrown prefab: step 0 done, {} actors in the world now ({:+})", After, After - Before);
+					bStep0Spawned = After > Before;
+				}
+				else
+					LOG_WARN(LogCreative, "Thrown prefab: step 0 skipped, FortPlaysetItemDefinition has no SpawnActorsInPlayset");
+			}
+			else
+				LOG_WARN(LogCreative, "Thrown prefab: step 0 skipped, Default__FortPlaysetItemDefinition not found");
+		}
+
 		LOG_INFO(LogCreative, "Thrown prefab: {} (playset {} from {}) at {} is in state {}, stream component {}", Name, UsePlayset->GetName(), Source, Where(Volume), (int)Volume->GetVolumeState(), HasStream() ? "present" : "missing");
+
+		if (bStep0Spawned)
+		{
+			LOG_INFO(LogCreative, "Thrown prefab: step 0 placed the prefab, the other steps are skipped");
+			++Loaded;
+			continue;
+		}
 
 		// Step 1: the game's native SpawnVolume sets the volume's playset directly and skips the SetCurrentPlayset function, which is the one that
 		// would set the volume up for loading. Call that function (clearing the field first, so it does not see "nothing changed").
@@ -866,4 +933,444 @@ void CreativeIsland::LogBudget(const char* Why, int MaxTimes)
 	}
 
 	Controllers.Free();
+}
+
+
+// ---------------------------------------------------------------------------------------------------------------------
+// CreativeMinigame
+// ---------------------------------------------------------------------------------------------------------------------
+namespace CreativeMinigame
+{
+	static DWORD GameThreadId = 0;
+	static std::map<UObject*, ULONGLONG> EndRequests; // controller -> when it pressed End Game
+
+	enum EState { PreGame = 0, Setup = 1, Transitioning = 2, WaitingForCameras = 3, Warmup = 4, InProgress = 5, PostGameTimeDilation = 6, PostRoundEnd = 7, PostGameEnd = 8, PostGameAbandon = 9, PostGameReset = 10 };
+
+	static const char* NameOf(int State)
+	{
+		static const char* Names[] = { "PreGame", "Setup", "Transitioning", "WaitingForCameras", "Warmup", "InProgress", "PostGameTimeDilation", "PostRoundEnd", "PostGameEnd", "PostGameAbandon", "PostGameReset" };
+		return State >= 0 && State <= 10 ? Names[State] : "?";
+	}
+
+	struct Driver
+	{
+		int State = -1;
+		ULONGLONG Since = 0;
+		ULONGLONG LastDriven = 0;
+		bool bAdded = false;
+		bool bTeleported = false;
+		bool bAdvanced = false;
+		bool bLimitCalled = false;
+		bool bEndCalled = false;
+		bool bResetDone = false;
+	};
+
+	static std::map<UObject*, Driver> Drivers;
+
+	static bool Call(UObject* Object, const char* Function, void* Params = nullptr)
+	{
+		if (!Object)
+			return false;
+
+		auto Fn = Object->FindFunction(Function);
+
+		if (!Fn)
+		{
+			LOG_WARN(LogCreative, "Minigame driver: {} has no function {}", Object->GetName(), Function);
+			return false;
+		}
+
+		Object->ProcessEvent(Fn, Params);
+		return true;
+	}
+
+	static int StateOf(UObject* Minigame)
+	{
+		static auto Offset = Minigame->GetOffset("CurrentState", false);
+		return Offset == -1 ? -1 : (int)Minigame->Get<uint8_t>(Offset);
+	}
+
+	static UObject* IslandMinigame(AFortVolume* Volume)
+	{
+		static auto ManagerDefault = FindObject<UObject>(L"/Script/FortniteGame.Default__FortVolumeManager");
+
+		if (!ManagerDefault || !Volume)
+			return nullptr;
+
+		auto Fn = ManagerDefault->FindFunction("GetMinigameForVolume");
+
+		if (!Fn)
+			return nullptr;
+
+		struct { AFortVolume* Volume; UObject* ReturnValue; } Params{ Volume, nullptr };
+		ManagerDefault->ProcessEvent(Fn, &Params);
+		return Params.ReturnValue;
+	}
+
+	static UObject* Manager()
+	{
+		static auto ManagerClass = FindObject<UClass>(L"/Script/FortniteGame.FortVolumeManager");
+
+		if (!ManagerClass)
+			return nullptr;
+
+		auto Managers = UGameplayStatics::GetAllActorsOfClass(GetWorld(), ManagerClass);
+		UObject* Found = Managers.Num() > 0 ? Managers.at(0) : nullptr;
+		Managers.Free();
+		return Found;
+	}
+
+	// Sets the state the way the game's own setter would: the field, then its OnRep (which runs the minigame logic components), then the handler for that state.
+	static void ForceState(UObject* Minigame, int NewState, const char* Why)
+	{
+		static auto CurrentOffset = Minigame->GetOffset("CurrentState", false);
+		static auto PreviousOffset = Minigame->GetOffset("PreviousState", false);
+
+		if (CurrentOffset == -1)
+			return;
+
+		const int Old = (int)Minigame->Get<uint8_t>(CurrentOffset);
+
+		LOG_WARN(LogCreative, "Minigame driver: forcing {} from {} to {} ({})", Minigame->GetName(), NameOf(Old), NameOf(NewState), Why);
+
+		if (PreviousOffset != -1)
+			Minigame->Get<uint8_t>(PreviousOffset) = (uint8_t)Old;
+
+		Minigame->Get<uint8_t>(CurrentOffset) = (uint8_t)NewState;
+		CreativeIsland::CallOnRep(Minigame, "OnRep_CurrentState");
+
+		if (NewState == Warmup)
+			Call(Minigame, "HandleMinigameWarmup");
+		else if (NewState == InProgress)
+			Call(Minigame, "HandleMinigameStarted");
+		else if (NewState == PostGameEnd || NewState == PostRoundEnd)
+			Call(Minigame, "HandleMinigameEnded");
+	}
+
+	static void Advance(UObject* Minigame, const char* Why)
+	{
+		const int Before = StateOf(Minigame);
+		Call(Minigame, "AdvanceState");
+		LOG_INFO(LogCreative, "Minigame driver: AdvanceState on {} ({}): {} -> {}", Minigame->GetName(), Why, NameOf(Before), NameOf(StateOf(Minigame)));
+	}
+
+	static std::vector<AFortPlayerControllerAthena*> ControllersOn(AFortVolume* Volume)
+	{
+		std::vector<AFortPlayerControllerAthena*> Result;
+		static auto ControllerClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerControllerAthena");
+
+		if (!ControllerClass)
+			return Result;
+
+		auto Controllers = UGameplayStatics::GetAllActorsOfClass(GetWorld(), ControllerClass);
+
+		for (int i = 0; i < Controllers.Num(); ++i)
+		{
+			auto Controller = (AFortPlayerControllerAthena*)Controllers.at(i);
+
+			if (Controller && Controller->GetCreativePlotLinkedVolume() == Volume)
+				Result.push_back(Controller);
+		}
+
+		Controllers.Free();
+		return Result;
+	}
+
+	// The player start plate (the "Player Start" device) nearest to a pawn, or null if the island has none.
+	static AActor* NearestStartPlate(AActor* Near)
+	{
+		static auto PlateClass = FindObject<UClass>(L"/Game/Athena/Playset/MinigamePlayerStartPlate.MinigamePlayerStartPlate_C");
+
+		if (!PlateClass || !Near)
+			return nullptr;
+
+		auto Plates = UGameplayStatics::GetAllActorsOfClass(GetWorld(), PlateClass);
+		AActor* Best = nullptr;
+		double BestDistance = 0;
+		const auto From = Near->GetActorLocation();
+
+		for (int i = 0; i < Plates.Num(); ++i)
+		{
+			auto Plate = Plates.at(i);
+
+			if (!Plate)
+				continue;
+
+			const auto To = Plate->GetActorLocation();
+			const double dx = (double)To.X - (double)From.X, dy = (double)To.Y - (double)From.Y, dz = (double)To.Z - (double)From.Z;
+			const double Distance = dx * dx + dy * dy + dz * dz;
+
+			if (!Best || Distance < BestDistance)
+			{
+				Best = Plate;
+				BestDistance = Distance;
+			}
+		}
+
+		Plates.Free();
+		return Best;
+	}
+
+	void NoteGameThread()
+	{
+		GameThreadId = GetCurrentThreadId();
+	}
+
+	void NoteEndRequested(UObject* Controller)
+	{
+		EndRequests[Controller] = GetTickCount64();
+		LOG_INFO(LogCreative, "Minigame driver: {} pressed End Game", Controller ? Controller->GetName() : std::string("null"));
+	}
+
+	static void Drive(UObject* Minigame, AFortVolume* Volume, AFortPlayerControllerAthena* Controller, ULONGLONG Now)
+	{
+		auto& D = Drivers[Minigame];
+
+		if (D.LastDriven == Now)
+			return; // two players on one island
+
+		D.LastDriven = Now;
+
+		const int State = StateOf(Minigame);
+
+		if (State < 0)
+			return;
+
+		if (State != D.State)
+		{
+			static auto PlayerArrayOffset = Minigame->GetOffset("PlayerArray", false);
+			static auto TimeLimitOffset = Minigame->GetOffset("TimeLimit", false);
+			static auto WarmupOffset = Minigame->GetOffset("WarmupDuration", false);
+			static auto RoundOffset = Minigame->GetOffset("CurrentRound", false);
+			static auto TotalRoundsOffset = Minigame->GetOffset("TotalRounds", false);
+
+			// FMinigamePlayers is a fast array whose TArray<FMinigamePlayer> Players sits at +0x108.
+			const int Players = PlayerArrayOffset == -1 ? -1 : *(int*)((char*)Minigame + PlayerArrayOffset + 0x108 + 8);
+
+			LOG_INFO(LogCreative, "Minigame driver: {} is now {} (was {}); players in it {}, TimeLimit {}, WarmupDuration {}, round {} of {}", Minigame->GetName(), NameOf(State), D.State < 0 ? "unknown" : NameOf(D.State), Players,
+				TimeLimitOffset == -1 ? -1.f : Minigame->Get<float>(TimeLimitOffset), WarmupOffset == -1 ? -1.f : Minigame->Get<float>(WarmupOffset), RoundOffset == -1 ? -1 : Minigame->Get<int>(RoundOffset), TotalRoundsOffset == -1 ? -1 : Minigame->Get<int>(TotalRoundsOffset));
+
+			D.State = State;
+			D.Since = Now;
+			D.bAdvanced = false;
+
+			if (State == Transitioning) { D.bAdded = false; D.bTeleported = false; }
+			if (State == InProgress) { D.bLimitCalled = false; D.bEndCalled = false; }
+			if (State == PostGameReset) D.bResetDone = false;
+		}
+
+		const ULONGLONG Elapsed = Now - D.Since;
+		auto Players = ControllersOn(Volume);
+
+		// End Game was pressed: the game's own EndGame is given a moment, then called.
+		auto Request = EndRequests.find(Controller);
+
+		if (Request != EndRequests.end())
+		{
+			if (State >= PostGameTimeDilation || State == PreGame)
+				EndRequests.erase(Request);
+			else if (Now - Request->second > 1500)
+			{
+				LOG_INFO(LogCreative, "Minigame driver: End Game was pressed {} ms ago and {} is still {}, calling EndGame", (int)(Now - Request->second), Minigame->GetName(), NameOf(State));
+				struct { UObject* Instigator; uint8_t Method; } Params{ Controller, 1 /* EndGame */ };
+				Call(Minigame, "EndGame", &Params);
+				LOG_INFO(LogCreative, "Minigame driver: after EndGame it is {}", NameOf(StateOf(Minigame)));
+				EndRequests.erase(Request);
+
+				if (StateOf(Minigame) < PostGameTimeDilation)
+					ForceState(Minigame, PostGameEnd, "EndGame did nothing");
+
+				return;
+			}
+		}
+
+		switch (State)
+		{
+		case Setup:
+			if (Elapsed > 3000 && !D.bAdvanced) { D.bAdvanced = true; Advance(Minigame, "stuck in Setup"); }
+			break;
+
+		case Transitioning:
+		{
+			// 1. everyone in the island is a participant
+			if (Elapsed > 600 && !D.bAdded)
+			{
+				D.bAdded = true;
+
+				for (auto Player : Players)
+				{
+					auto PlayerState = Player->GetPlayerState();
+					struct { UObject* PlayerState; bool bCheckSpectating; bool ReturnValue; } InGame{ PlayerState, false, false };
+
+					if (Call(Minigame, "IsPlayerInMinigame", &InGame) && InGame.ReturnValue)
+					{
+						LOG_INFO(LogCreative, "Minigame driver: {} is already a participant", Describe(PlayerState));
+						continue;
+					}
+
+					struct { UObject* PlayerState; bool bForceSpawn; } Add{ PlayerState, true };
+					Call(Minigame, "AddMinigamePlayer", &Add);
+					LOG_INFO(LogCreative, "Minigame driver: added {} as a participant", Describe(PlayerState));
+				}
+			}
+
+			// 2. they are moved to a Player Start plate if there is one (otherwise they stay where they are)
+			if (Elapsed > 1200 && !D.bTeleported)
+			{
+				D.bTeleported = true;
+
+				for (auto Player : Players)
+				{
+					auto Pawn = Player->GetMyFortPawn();
+
+					if (!Pawn)
+						continue;
+
+					if (auto Plate = NearestStartPlate(Pawn))
+					{
+						auto Location = Plate->GetActorLocation();
+						Location.Z += 150;
+						Pawn->TeleportTo(Location, Pawn->GetActorRotation());
+						LOG_INFO(LogCreative, "Minigame driver: moved {} to the player start plate {} at {}", Describe(Pawn), Plate->GetName(), Where(Plate));
+					}
+					else
+						LOG_INFO(LogCreative, "Minigame driver: the island has no player start plate, {} stays where it is", Describe(Pawn));
+
+					struct { UObject* Pawn; } Finished{ Pawn };
+					Call(Minigame, "OnClientFinishTeleportingForMinigame", &Finished);
+				}
+			}
+
+			// 3. on to the next state
+			if (Elapsed > 2000 && !D.bAdvanced) { D.bAdvanced = true; Advance(Minigame, "Transitioning"); }
+			if (Elapsed > 4000) ForceState(Minigame, Warmup, "Transitioning never ended");
+			break;
+		}
+
+		case WaitingForCameras:
+			if (Elapsed > 1000 && !D.bAdvanced) { D.bAdvanced = true; Advance(Minigame, "WaitingForCameras"); }
+			if (Elapsed > 3000) ForceState(Minigame, Warmup, "WaitingForCameras never ended");
+			break;
+
+		case Warmup:
+		{
+			static auto WarmupOffset = Minigame->GetOffset("WarmupDuration", false);
+			float Seconds = WarmupOffset == -1 ? 3.f : Minigame->Get<float>(WarmupOffset);
+			Seconds = Seconds < 0.f ? 0.f : (Seconds > 15.f ? 15.f : Seconds);
+			const ULONGLONG WarmupMs = (ULONGLONG)(Seconds * 1000.f);
+
+			if (Elapsed > WarmupMs + 500 && !D.bAdvanced) { D.bAdvanced = true; Advance(Minigame, "Warmup over"); }
+			if (Elapsed > WarmupMs + 2500) ForceState(Minigame, InProgress, "Warmup never ended");
+			break;
+		}
+
+		case InProgress:
+		{
+			static auto TimeLimitOffset = Minigame->GetOffset("TimeLimit", false);
+			// The unit of TimeLimit is not known (seconds, or the minutes shown in the settings), so a small value is read as minutes: a 5 minute game
+			// must not end after 5 seconds.
+			const float RawLimit = TimeLimitOffset == -1 ? 0.f : Minigame->Get<float>(TimeLimitOffset);
+			const float Limit = RawLimit > 0.f && RawLimit < 30.f ? RawLimit * 60.f : RawLimit;
+
+			if (Limit > 0.f)
+			{
+				const ULONGLONG LimitMs = (ULONGLONG)(Limit * 1000.f);
+
+				if (Elapsed > LimitMs && !D.bLimitCalled) { D.bLimitCalled = true; LOG_INFO(LogCreative, "Minigame driver: the time limit ({} s) is over", Limit); Call(Minigame, "OnTimeLimitElapsed"); }
+
+				if (Elapsed > LimitMs + 3000 && !D.bEndCalled)
+				{
+					D.bEndCalled = true;
+					struct { UObject* Instigator; uint8_t Method; } Params{ nullptr, 1 };
+					Call(Minigame, "EndGame", &Params);
+
+					if (StateOf(Minigame) == InProgress)
+						ForceState(Minigame, PostGameEnd, "time limit over, EndGame did nothing");
+				}
+			}
+			break;
+		}
+
+		case PostGameTimeDilation:
+		case PostRoundEnd:
+		case PostGameEnd:
+			if (Elapsed > 4000 && !D.bAdvanced) { D.bAdvanced = true; Advance(Minigame, "post game"); }
+			if (Elapsed > 8000) ForceState(Minigame, PostGameReset, "post game never ended");
+			break;
+
+		case PostGameAbandon:
+			if (Elapsed > 1500) ForceState(Minigame, PostGameReset, "abandoned");
+			break;
+
+		case PostGameReset:
+		{
+			if (!D.bResetDone)
+			{
+				D.bResetDone = true;
+				Call(Minigame, "PostGameResetPlayers");
+
+				if (auto VolumeManager = Manager())
+				{
+					struct { AFortVolume* Volume; } Params{ Volume };
+					Call(VolumeManager, "MinigameExitReadOnlyForVolume", &Params);
+				}
+
+				LOG_INFO(LogCreative, "Minigame driver: players reset, island volume is now state {}", (int)Volume->GetVolumeState());
+			}
+
+			if (Elapsed > 1500)
+			{
+				ForceState(Minigame, PreGame, "game over, back to editing");
+
+				if (Volume->GetVolumeState() != EVolumeState::Ready)
+				{
+					Volume->GetVolumeState() = EVolumeState::Ready;
+					CreativeIsland::CallOnRep(Volume, "OnRep_VolumeState");
+				}
+			}
+			break;
+		}
+
+		default:
+			break;
+		}
+	}
+
+	void Tick()
+	{
+		if (!Globals::bDriveMinigames || !GameThreadId || GetCurrentThreadId() != GameThreadId)
+			return;
+
+		static bool bInTick = false;
+		static ULONGLONG Last = 0;
+
+		const ULONGLONG Now = GetTickCount64();
+
+		if (bInTick || Now - Last < 250)
+			return;
+
+		Last = Now;
+		bInTick = true;
+
+		static auto ControllerClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerControllerAthena");
+
+		if (ControllerClass)
+		{
+			auto Controllers = UGameplayStatics::GetAllActorsOfClass(GetWorld(), ControllerClass);
+
+			for (int i = 0; i < Controllers.Num(); ++i)
+			{
+				auto Controller = (AFortPlayerControllerAthena*)Controllers.at(i);
+				auto Volume = Controller ? Controller->GetCreativePlotLinkedVolume() : nullptr;
+				auto Minigame = Volume ? IslandMinigame(Volume) : nullptr;
+
+				if (Minigame)
+					Drive(Minigame, Volume, Controller, Now);
+			}
+
+			Controllers.Free();
+		}
+
+		bInTick = false;
+	}
 }

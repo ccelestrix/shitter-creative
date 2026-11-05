@@ -79,6 +79,8 @@ static inline void CreativeAfterProcessEvent(UObject* Object, UFunction* Functio
 		CreativeIsland::LoadThrownPrefab(Object, Parameters ? *(UObject**)Parameters : nullptr);
 	else if (Which == 2)
 		CreativeIsland::LogMinigameStates(Function->GetName().c_str());
+
+	CreativeMinigame::Tick();
 }
 
 static inline void ProcessEventHook(UObject* Object, UFunction* Function, void* Parameters)
