@@ -26,6 +26,7 @@
 #include "FortAthenaMutator_Disco.h"
 #include "globals.h"
 #include "Fonts/ruda-bold.h"
+#include "XenbonoTheme.h" // the look: same as the Xenon game server window
 #include "Vector.h"
 #include "xenbono.h"
 #include "botnames.h"
@@ -184,10 +185,15 @@ static inline void InitFont()
 {
 	ImFontConfig FontConfig;
 	FontConfig.FontDataOwnedByAtlas = false;
-	ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void*)ruda_bold_data, sizeof(ruda_bold_data), 17.f, &FontConfig);
+	ImGui::GetIO().Fonts->AddFontFromMemoryTTF((void*)XenbonoFont, (int)XenbonoFontSize, 16.f, &FontConfig); // Bricolage Grotesque, like the Shatter sites
 }
 
 static inline void InitStyle()
+{
+	XenbonoTheme::Apply(ImGui::GetStyle(), 1.f);
+}
+
+[[maybe_unused]] static inline void InitStyleOld()
 {
 	auto& mStyle = ImGui::GetStyle();
 	mStyle.FramePadding = ImVec2(4, 2);
@@ -306,8 +312,8 @@ static inline void InputVector(const std::string& baseText, FVector* vec)
 #endif
 }
 
-static int Width = 640;
-static int Height = 480;
+static int Width = 720;
+static int Height = 680;
 
 static int Tab = 1;
 static int PlayerTab = -1;
@@ -1616,11 +1622,12 @@ static inline DWORD WINAPI GuiThread(LPVOID)
 	// Setup Platform/Renderer backends
 	ImGui_ImplWin32_Init(hwnd);
 	ImGui_ImplDX9_Init(g_pd3dDevice);
+	XenbonoTheme::CreateLogo(g_pd3dDevice);
 
 	// Our state
 	bool show_demo_window = true;
 	bool show_another_window = false;
-	ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
+	ImVec4 clear_color = XenbonoTheme::Col::Bg;
 
 	ImFontConfig config;
 	config.MergeMode = true;
@@ -1663,7 +1670,17 @@ static inline DWORD WINAPI GuiThread(LPVOID)
 
 		if (!ImGui::IsWindowCollapsed())
 		{
-			ImGui::Begin("XENBONO", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
+			ImGui::Begin("XENBONO", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse);
+
+			XenbonoTheme::Watermark(1.f);
+
+			// the top bar: the logo, the name, which Fortnite this server runs, and what it is doing right now
+			{
+				const auto State = !Globals::bInitializedPlaylist ? XenbonoTheme::State::SettingUp : (!bStartedBus ? XenbonoTheme::State::Joinable : XenbonoTheme::State::InMatch);
+				char VersionText[64];
+				sprintf_s(VersionText, "Fortnite %.2f  -  UE %.2f", Fortnite_Version, Engine_Version / 100.0);
+				XenbonoTheme::Header(1.f, VersionText, State);
+			}
 
 			Globals::bInitializedPlaylist ? MainUI() : PregameUI();
 
