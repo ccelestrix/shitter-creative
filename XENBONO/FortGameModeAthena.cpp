@@ -734,7 +734,7 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 	{
 		static auto FortPlayerStartCreativeClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStartCreative");
 		static auto FortPlayerStartWarmupClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStartWarmup");
-		TArray<AActor*> Actors = UGameplayStatics::GetAllActorsOfClass(GetWorld(), Globals::bCreative ? FortPlayerStartCreativeClass : FortPlayerStartWarmupClass);
+		TArray<AActor*> Actors = UGameplayStatics::GetAllActorsOfClass(GetWorld(), IsCreativeGame() ? FortPlayerStartCreativeClass : FortPlayerStartWarmupClass);
 
 		int ActorsNum = Actors.Num();
 
@@ -747,7 +747,7 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 			if (!bLoggedNoStarts)
 			{
 				bLoggedNoStarts = true;
-				LOG_WARN(LogCreative, "Not ready to start: there are no {} actors in the map", Globals::bCreative ? "FortPlayerStartCreative" : "FortPlayerStartWarmup");
+				LOG_WARN(LogCreative, "Not ready to start: there are no {} actors in the map", IsCreativeGame() ? "FortPlayerStartCreative" : "FortPlayerStartWarmup");
 			}
 
 			return false;
@@ -761,7 +761,7 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 	// The Creative tick box opens the creative map, which has no Athena map info, so it must not wait for one.
 	if (Engine_Version >= 421 // todo recheck this version 
 		&& (bIsAthenaMap ? !MapInfo : false)
-		&& !Globals::bCreative
+		&& !IsCreativeGame()
 		)
 	{
 		static bool bLoggedNoMapInfo = false;
