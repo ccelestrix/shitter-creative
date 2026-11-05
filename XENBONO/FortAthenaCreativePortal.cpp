@@ -555,6 +555,171 @@ void CreativeIsland::DumpState(const std::string& Reason, int MaxTimes)
 	LOG_INFO(LogCreative, "======== end of creative state ========");
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Probes and raw memory helpers, for working out how a prefab is stored (the layouts of some record structs are not in the SDK)
+// ---------------------------------------------------------------------------------------------------------------------
+static bool Readable(const void* Pointer, size_t Size)
+{
+	if (!Pointer)
+		return false;
+
+	MEMORY_BASIC_INFORMATION Info{};
+
+	if (!VirtualQuery(Pointer, &Info, sizeof(Info)) || Info.State != MEM_COMMIT || (Info.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+		return false;
+
+	return (const char*)Pointer + Size <= (const char*)Info.BaseAddress + Info.RegionSize;
+}
+
+static void LogHex(const std::string& Label, const void* Pointer, size_t Size)
+{
+	if (!Readable(Pointer, Size))
+	{
+		LOG_WARN(LogCreative, "{}: {} bytes at {} are not readable", Label, Size, __int64(Pointer));
+		return;
+	}
+
+	for (size_t Row = 0; Row < Size; Row += 16)
+	{
+		std::string Line;
+
+		for (size_t i = Row; i < Row + 16 && i < Size; ++i)
+			Line += std::format("{:02x} ", ((const unsigned char*)Pointer)[i]);
+
+		LOG_INFO(LogCreative, "{} +0x{:02x}: {}", Label, Row, Line);
+	}
+}
+
+static std::string FloatsAt(const void* Pointer, int Count)
+{
+	if (!Readable(Pointer, Count * sizeof(float)))
+		return "unreadable";
+
+	std::string Text;
+
+	for (int i = 0; i < Count; ++i)
+		Text += std::format("{:.1f} ", ((const float*)Pointer)[i]);
+
+	return Text;
+}
+
+// A name read out of raw memory: only trusted when the index looks like a real one.
+static std::string NameAt(const void* Pointer)
+{
+	if (!Readable(Pointer, 8))
+		return "unreadable";
+
+	const int Index = *(const int*)Pointer;
+
+	if (Index <= 0 || Index > 8000000)
+		return std::format("(not a name: {})", Index);
+
+	return ((const FName*)Pointer)->ToString();
+}
+
+struct ActorProbe
+{
+	std::string Label;
+	std::set<AActor*> Before;
+	ULONGLONG Started = 0;
+	FVector Anchor;
+	std::string AnchorName;
+	int Stage = 0;
+};
+
+static std::vector<ActorProbe> Probes;
+
+void CreativeIsland::StartActorProbe(const std::string& Label, AActor* Anchor)
+{
+	static auto ActorClass = FindObject<UClass>(L"/Script/Engine.Actor");
+
+	if (!ActorClass || Probes.size() > 8)
+		return;
+
+	ActorProbe Probe;
+	Probe.Label = Label;
+	Probe.Started = GetTickCount64();
+
+	if (Anchor)
+		Probe.Anchor = Anchor->GetActorLocation();
+
+	Probe.AnchorName = Anchor ? Anchor->GetName() : std::string("no anchor");
+
+	auto Actors = UGameplayStatics::GetAllActorsOfClass(GetWorld(), ActorClass);
+
+	for (int i = 0; i < Actors.Num(); ++i)
+		Probe.Before.insert(Actors.at(i));
+
+	Actors.Free();
+	LOG_INFO(LogCreative, "Actor probe '{}' started: {} actors exist, anchor {} at {}", Label, (int)Probe.Before.size(), Probe.AnchorName, Where(Anchor));
+	Probes.push_back(std::move(Probe));
+}
+
+void CreativeIsland::TickProbes()
+{
+	if (Probes.empty())
+		return;
+
+	static auto ActorClass = FindObject<UClass>(L"/Script/Engine.Actor");
+	const ULONGLONG Now = GetTickCount64();
+	static const ULONGLONG Stages[] = { 500, 2000, 6000 };
+
+	for (size_t p = 0; p < Probes.size();)
+	{
+		auto& Probe = Probes[p];
+
+		if (Probe.Stage >= 3)
+		{
+			Probes.erase(Probes.begin() + p);
+			continue;
+		}
+
+		if (Now - Probe.Started < Stages[Probe.Stage])
+		{
+			++p;
+			continue;
+		}
+
+		const int Stage = Probe.Stage++;
+		(void)Stage;
+		auto Actors = UGameplayStatics::GetAllActorsOfClass(GetWorld(), ActorClass);
+		int NewCount = 0;
+		std::map<std::string, int> ByClass;
+		std::vector<std::string> Samples;
+
+		for (int i = 0; i < Actors.Num(); ++i)
+		{
+			auto Actor = Actors.at(i);
+
+			if (!Actor || Probe.Before.count(Actor))
+				continue;
+
+			++NewCount;
+			++ByClass[Actor->ClassPrivate ? Actor->ClassPrivate->GetName() : std::string("?")];
+
+			if (Samples.size() < 6)
+			{
+				const auto Location = Actor->GetActorLocation();
+				Samples.push_back(std::format("{} at {} ({:+.0f} {:+.0f} {:+.0f} from the anchor)", Actor->GetName(), Where(Actor), (double)Location.X - (double)Probe.Anchor.X, (double)Location.Y - (double)Probe.Anchor.Y, (double)Location.Z - (double)Probe.Anchor.Z));
+			}
+		}
+
+		Actors.Free();
+
+		std::string Classes;
+
+		for (auto& Entry : ByClass)
+			Classes += std::format(" {}x{}", Entry.second, Entry.first);
+
+		LOG_INFO(LogCreative, "Actor probe '{}' after {} ms: {} new actors:{}", Probe.Label, (int)(Now - Probe.Started), NewCount, Classes.empty() ? std::string(" none") : Classes);
+
+		for (auto& Sample : Samples)
+			LOG_INFO(LogCreative, "  new actor {}", Sample);
+
+		++p;
+	}
+}
+
 void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 {
 	// The grenade's OnLoaded callback fires for every asset it loads (sounds, effects, ...), so only a real playset is used. Anything else is ignored.
@@ -1428,7 +1593,7 @@ namespace CreativeMinigame
 
 	void Tick()
 	{
-		if (!Globals::bDriveMinigames || !GameThreadId || GetCurrentThreadId() != GameThreadId)
+		if (!GameThreadId || GetCurrentThreadId() != GameThreadId)
 			return;
 
 		static bool bInTick = false;
@@ -1441,6 +1606,14 @@ namespace CreativeMinigame
 
 		Last = Now;
 		bInTick = true;
+
+		CreativeIsland::TickProbes();
+
+		if (!Globals::bDriveMinigames)
+		{
+			bInTick = false;
+			return;
+		}
 
 		static auto ControllerClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerControllerAthena");
 

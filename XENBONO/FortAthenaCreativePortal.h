@@ -105,6 +105,10 @@ namespace CreativeIsland
 	void LogMinigameStates(const char* Why);
 	/** Writes the island's creative budget (the "memory used" bar at the top): total and used per category. */
 	void LogBudget(const char* Why, int MaxTimes = 40);
+	/** Remembers every actor that exists now; a little later the log says which new actors appeared and where. */
+	void StartActorProbe(const std::string& Label, class AActor* Anchor);
+	/** Writes the results of the actor probes that are due. Called from the minigame driver's tick. */
+	void TickProbes();
 }
 
 // Start Game / End Game. The game's server-side minigame flow is missing from this executable: after Start the island's minigame stops in

@@ -13,6 +13,8 @@ namespace Globals
 	// Also marks a thrown prefab's volume Ready (state 3) and tells the clients, like the island setup does. Off: forcing the state of that volume in an
 	// earlier version was followed by a server crash, so it is tested on its own.
 	extern inline bool bPrefabMarkReady = false;
+	// Applies the first few saved records of a thrown prefab's props with the volume manager's own ApplyLevelSaveToWorld, and logs where the actors appear.
+	extern inline bool bPrefabApplyRecords = false;
 	extern inline bool bCreative = false; // the Creative tick box: opens the creative hub map. Off by default, 12.41 runs the creative playlist on the normal map.
 	extern inline bool bGoingToPlayEvent = false;
 	extern inline bool bEnableAGIDs = true;

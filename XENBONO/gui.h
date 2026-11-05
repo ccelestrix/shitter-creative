@@ -336,6 +336,9 @@ static inline void StaticUI()
 	if (IsCreativeGame())
 		ImGui::Checkbox("Thrown prefabs: also mark their volume Ready (test on its own)", &Globals::bPrefabMarkReady);
 
+	if (IsCreativeGame())
+		ImGui::Checkbox("Thrown prefabs: apply the props' saved records (test on its own)", &Globals::bPrefabApplyRecords);
+
 	if (IsRestartingSupported())
 	{
 		// ImGui::Checkbox("Auto Restart", &Globals::bAutoRestart);
