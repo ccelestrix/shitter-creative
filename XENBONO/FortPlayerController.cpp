@@ -900,13 +900,13 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 
 	LOG_INFO(LogCreative, "ServerCreateBuildingActor: {} wants {} at {} {} {}", PlayerController->GetName(), BuildingClass->GetName(), BuildLocation.X, BuildLocation.Y, BuildLocation.Z);
 
-	// In Creative the game's own handler places the piece: it knows about the island grid and volume, and plays the build animation.
-	// Placing it here as well gave ghost builds, doubled pieces and no animation.
-	if (IsCreativeGame())
-	{
-		LOG_INFO(LogCreative, "ServerCreateBuildingActor: Creative, the game places the piece itself");
-		return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
-	}
+	// Counts the pieces of this class that exist, so the log shows who made one: this hook or the game's own handler.
+	auto CountPieces = [&]() -> int {
+		auto Pieces = UGameplayStatics::GetAllActorsOfClass(GetWorld(), BuildingClass);
+		const int Count = Pieces.Num();
+		Pieces.Free();
+		return Count;
+	};
 
 	auto GameState = Cast<AFortGameStateAthena, false>(Cast<AFortGameMode, false>(GetWorld()->GetGameMode())->GetGameState());
 
@@ -992,6 +992,9 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 	BuildingActor->InitializeBuildingActor(PlayerController, BuildingActor, true);
 	BuildingActor->SetTeam(PlayerStateAthena->GetTeamIndex()); // required?
 
+	if (IsCreativeGame())
+		LOG_INFO(LogCreative, "ServerCreateBuildingActor: placed {} at {} {} {} ourselves, {} pieces of this class exist now", BuildingClass->GetName(), BuildLocation.X, BuildLocation.Y, BuildLocation.Z, CountPieces());
+
 	/*
 
 	GET_PLAYLIST(GameState);
@@ -1000,6 +1003,14 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 	{
 		// CurrentPlaylist->ApplyModifiersToActor(BuildingActor); // seems automatic
 	} */
+
+	if (IsCreativeGame())
+	{
+		const int Before = CountPieces();
+		ServerCreateBuildingActorOriginal(Context, Stack, Ret);
+		LOG_INFO(LogCreative, "ServerCreateBuildingActor: after the game's own handler there are {} pieces of this class (before: {})", CountPieces(), Before);
+		return;
+	}
 
 	return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
 }

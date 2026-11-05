@@ -30,7 +30,7 @@ static inline void LogCreativeProcessEvent(UObject* Object, UFunction* Function)
 
 		auto Has = [&FullName](const char* Text) { return FullName.find(Text) != std::string::npos; };
 
-		const bool bInteresting = (Has("Playset") || Has("Volume") || Has("Grenade") || Has("Minigame") || Has("Creative") || Has("Prefab") || Has("Plot") || Has("Island") || Has("Thermometer") || Has("Throw"))
+		const bool bInteresting = (Has("Playset") || Has("Volume") || Has("Grenade") || Has("Minigame") || Has("Creative") || Has("Prefab") || Has("Plot") || Has("Island") || Has("Thermometer") || Has("Throw") || Has("Building:") || Has("BuildingSMActor") || Has("BuildingActor"))
 			&& !Has("Audio") && !Has("Sound") && !Has("Submix") && !Has("PostProcess") && !Has("Physics") && !Has("LevelStreamingVolume") && !Has("Tick") && !Has("Animation") && !Has("Anim");
 
 		Found = CallsLeft.emplace(Function, bInteresting ? 25 : -1).first;
