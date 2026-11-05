@@ -1,8 +1,9 @@
-# XENBONO
+# XENBONO 67 phonko
+this a skibididi gs with many phonkos
 
 XENBONO is the Fortnite game server used by Shatter, with a focus on getting **Creative working on 12.41 (Chapter 2 Season 2)**.
 
-It is a fork of [Project Reboot 3.0](https://github.com/Milxnor/Project-Reboot-3.0) by Milxnor, used under its BSD 3-Clause licence (see `LICENSE`). XENBONO is not affiliated with Epic Games, Inc.
+XENBONO is not affiliated with Epic Games, Inc.
 
 ## Build
 
