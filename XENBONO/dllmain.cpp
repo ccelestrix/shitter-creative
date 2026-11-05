@@ -693,7 +693,7 @@ void ChangeLevels()
         : Globals::bCreative ? L"open Creative_NoApollo_Terrain"
         : L"open Artemis_Terrain"
         : Globals::bCreative ? L"open Creative_NoApollo_Terrain"
-        : L"open Apollo_Terrain");
+        : L"open Creative_NoApollo_Terrain");
 
     FString Level = /* bUseCustomMap ? bruh.c_str() : */ (Engine_Version < 424
         ? L"Athena_Terrain" : Engine_Version >= 500 ? Fortnite_Version >= 23
