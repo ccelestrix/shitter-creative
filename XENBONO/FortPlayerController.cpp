@@ -898,6 +898,8 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 	if (!BuildingClass)
 		return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
 
+	LOG_INFO(LogCreative, "ServerCreateBuildingActor: {} wants {} at {} {} {}", PlayerController->GetName(), BuildingClass->GetName(), BuildLocation.X, BuildLocation.Y, BuildLocation.Z);
+
 	auto GameState = Cast<AFortGameStateAthena, false>(Cast<AFortGameMode, false>(GetWorld()->GetGameMode())->GetGameState());
 
 	auto StructuralSupportSystem = GameState->GetStructuralSupportSystem();
@@ -906,6 +908,7 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 	{
 		if (!StructuralSupportSystem->IsWorldLocValid(BuildLocation))
 		{
+			LOG_INFO(LogCreative, "ServerCreateBuildingActor: the location is not valid for the structural support system, the game's own handler runs instead");
 			return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
 		}
 	}

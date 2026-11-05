@@ -209,41 +209,23 @@ XENBONO_CREATIVE_LOG_HOOK(ServerReloadCreativePlot)
 XENBONO_CREATIVE_LOG_HOOK(ServerEndLoadingVolume)
 XENBONO_CREATIVE_LOG_HOOK(ServerEndUnloadingVolume)
 XENBONO_CREATIVE_LOG_HOOK(ServerSetOnCreativePortalLoadedDelegate)
-
-// Confirm on the Select Type screen: the player picked an island layout.
-static void (*ServerSetPlaysetOriginal)(UObject*, FFrame&, void*) = nullptr;
-
-static void ServerSetPlaysetHook(UObject* Context, FFrame& Stack, void* Ret)
-{
-	UFortPlaysetItemDefinition* NewPlayset = nullptr;
-	Stack.StepCompiledIn(&NewPlayset);
-
-	if (Stack.Code)
-		Stack.Code++;
-
-	auto Controller = (AFortPlayerControllerAthena*)Context;
-
-	LOG_INFO(LogCreative, "Client called ServerSetPlayset on {}: playset {}", Context ? Context->GetName() : std::string("null"), NewPlayset ? NewPlayset->GetName() : std::string("null"));
-
-	if (!Controller || !NewPlayset)
-		return;
-
-	static auto CurrentPlaysetOffset = Controller->GetOffset("CurrentPlayset", false);
-
-	if (CurrentPlaysetOffset != -1)
-		Controller->Get<UFortPlaysetItemDefinition*>(CurrentPlaysetOffset) = NewPlayset;
-
-	auto Volume = Controller->GetCreativePlotLinkedVolume();
-
-	if (!Volume)
-	{
-		LOG_WARN(LogCreative, "ServerSetPlayset: {} has no linked island volume, nothing to load the playset into", Controller->GetName());
-		return;
-	}
-
-	UFortPlaysetItemDefinition::ShowPlayset(NewPlayset, Volume);
-	LOG_INFO(LogCreative, "ServerSetPlayset: loaded {} into the island volume {}", NewPlayset->GetName(), __int64(Volume));
-}
+// The game calls this every time a prefab is picked in the menu (it sets CurrentPlayset for the prefab to place), so it is only logged.
+XENBONO_CREATIVE_LOG_HOOK(ServerSetPlayset)
+// Start Game / End Game and the island portal.
+XENBONO_CREATIVE_LOG_HOOK(ServerStartMinigame)
+XENBONO_CREATIVE_LOG_HOOK(ServerEndMinigame)
+XENBONO_CREATIVE_LOG_HOOK(ServerRestartMinigame)
+XENBONO_CREATIVE_LOG_HOOK(ServerSetMinigameClassSlot)
+XENBONO_CREATIVE_LOG_HOOK(ServerToggleAutoRestartMinigame)
+XENBONO_CREATIVE_LOG_HOOK(ServerRespondToAbandonMatch)
+XENBONO_CREATIVE_LOG_HOOK(ServerStartInteractWithIslandPortal)
+XENBONO_CREATIVE_LOG_HOOK(ServerTeleportViaCreativePortal)
+XENBONO_CREATIVE_LOG_HOOK(ServerTryFindPlotItemForDefinition)
+XENBONO_CREATIVE_LOG_HOOK(ServerStartLoadingVolume)
+XENBONO_CREATIVE_LOG_HOOK(ServerStartUnloadingVolume)
+XENBONO_CREATIVE_LOG_HOOK(ServerStopSavingCreativePlot)
+XENBONO_CREATIVE_LOG_HOOK(ServerResetCurrentVolumeWithoutTeleport)
+XENBONO_CREATIVE_LOG_HOOK(ServerSpawnCreativeSupplyDrop)
 
 static void HookOne(UObject* ControllerDefault, const char* Name, void* Detour, void** Original)
 {
@@ -280,5 +262,19 @@ void CreativeIsland::HookControllerFunctions()
 	XENBONO_HOOK_CREATIVE(ServerEndUnloadingVolume);
 	XENBONO_HOOK_CREATIVE(ServerSetOnCreativePortalLoadedDelegate);
 	XENBONO_HOOK_CREATIVE(ServerSetPlayset);
+	XENBONO_HOOK_CREATIVE(ServerStartMinigame);
+	XENBONO_HOOK_CREATIVE(ServerEndMinigame);
+	XENBONO_HOOK_CREATIVE(ServerRestartMinigame);
+	XENBONO_HOOK_CREATIVE(ServerSetMinigameClassSlot);
+	XENBONO_HOOK_CREATIVE(ServerToggleAutoRestartMinigame);
+	XENBONO_HOOK_CREATIVE(ServerRespondToAbandonMatch);
+	XENBONO_HOOK_CREATIVE(ServerStartInteractWithIslandPortal);
+	XENBONO_HOOK_CREATIVE(ServerTeleportViaCreativePortal);
+	XENBONO_HOOK_CREATIVE(ServerTryFindPlotItemForDefinition);
+	XENBONO_HOOK_CREATIVE(ServerStartLoadingVolume);
+	XENBONO_HOOK_CREATIVE(ServerStartUnloadingVolume);
+	XENBONO_HOOK_CREATIVE(ServerStopSavingCreativePlot);
+	XENBONO_HOOK_CREATIVE(ServerResetCurrentVolumeWithoutTeleport);
+	XENBONO_HOOK_CREATIVE(ServerSpawnCreativeSupplyDrop);
 #undef XENBONO_HOOK_CREATIVE
 }
