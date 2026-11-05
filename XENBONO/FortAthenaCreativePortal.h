@@ -100,5 +100,5 @@ namespace CreativeIsland
 	/** Writes everything about the islands, portals, volumes, players and permissions to the log. Each reason is written at most a few times. */
 	void DumpState(const std::string& Reason, int MaxTimes = 3);
 	/** A thrown prefab/gallery grenade has loaded its playset: stream it into the volume the grenade spawned. */
-	void LoadThrownPrefab(UObject* Projectile, UObject* LoadedPlayset);
+	void LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset);
 }

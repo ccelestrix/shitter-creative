@@ -512,25 +512,29 @@ void CreativeIsland::DumpState(const std::string& Reason, int MaxTimes)
 	LOG_INFO(LogCreative, "======== end of creative state ========");
 }
 
-void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedPlayset)
+void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 {
-	auto Playset = (UFortPlaysetItemDefinition*)LoadedPlayset;
+	// The grenade's OnLoaded callback fires for every asset it loads (sounds, effects, ...), so only a real playset is used. Anything else is ignored.
+	static auto PlaysetClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlaysetItemDefinition");
+
+	auto IsPlayset = [&](UObject* Object) { return Object && PlaysetClass && Object->IsA(PlaysetClass); };
+
+	UFortPlaysetItemDefinition* Playset = IsPlayset(LoadedAsset) ? (UFortPlaysetItemDefinition*)LoadedAsset : nullptr;
 
 	if (!Playset && Projectile)
 	{
 		static auto CachedPlaysetOffset = Projectile->GetOffset("CachedPlayset", false);
 
 		if (CachedPlaysetOffset != -1)
-			Playset = Projectile->Get<UFortPlaysetItemDefinition*>(CachedPlaysetOffset);
+		{
+			auto Cached = Projectile->Get<UObject*>(CachedPlaysetOffset);
+
+			if (IsPlayset(Cached))
+				Playset = (UFortPlaysetItemDefinition*)Cached;
+		}
 	}
 
-	LOG_INFO(LogCreative, "Thrown prefab: projectile {} loaded playset {}", Describe(Projectile), Describe(Playset));
-
-	if (!Playset)
-	{
-		LOG_WARN(LogCreative, "Thrown prefab: no playset to load");
-		return;
-	}
+	LOG_INFO(LogCreative, "Thrown prefab: projectile {} loaded {} ({}), playset to use: {}", Describe(Projectile), Describe(LoadedAsset), LoadedAsset && !IsPlayset(LoadedAsset) ? "not a playset, ignored" : "playset", Describe(Playset));
 
 	static auto VolumeClass = FindObject<UClass>(L"/Script/FortniteGame.FortVolume");
 
@@ -554,9 +558,61 @@ void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedPlayse
 		if (Name.find("PrefabGrenades") == std::string::npos || AlreadyLoaded.contains(Name))
 			continue;
 
+		// The playset: the one the callback gave, else the grenade's cached one, else what the volume or its stream component already holds,
+		// else what the thrower picked (ServerSetPlayset sets the controller's CurrentPlayset when a prefab is picked or thrown).
+		UFortPlaysetItemDefinition* UsePlayset = Playset;
+		const char* Source = "the grenade";
+
+		auto Try = [&](UObject* Candidate, const char* From) {
+			if (!UsePlayset && IsPlayset(Candidate))
+			{
+				UsePlayset = (UFortPlaysetItemDefinition*)Candidate;
+				Source = From;
+			}
+		};
+
+		static auto VolumePlaysetOffset = Volume->GetOffset("CurrentPlayset", false);
+
+		if (VolumePlaysetOffset != -1)
+			Try(Volume->Get<UObject*>(VolumePlaysetOffset), "the volume");
+
+		static auto StreamClass = FindObject<UClass>("/Script/FortniteGame.PlaysetLevelStreamComponent");
+
+		if (auto Stream = StreamClass ? (UObject*)Volume->GetComponentByClass(StreamClass) : nullptr)
+		{
+			static auto StreamPlaysetOffset = Stream->GetOffset("CurrentPlayset", false);
+
+			if (StreamPlaysetOffset != -1)
+				Try(Stream->Get<UObject*>(StreamPlaysetOffset), "the volume's stream component");
+		}
+
+		if (!UsePlayset)
+		{
+			static auto ControllerClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerControllerAthena");
+			auto Controllers = ControllerClass ? UGameplayStatics::GetAllActorsOfClass(GetWorld(), ControllerClass) : TArray<AActor*>();
+
+			for (int c = 0; c < Controllers.Num() && !UsePlayset; ++c)
+			{
+				auto Controller = Controllers.at(c);
+				static auto ControllerPlaysetOffset = Controller ? Controller->GetOffset("CurrentPlayset", false) : -1;
+
+				if (Controller && ControllerPlaysetOffset != -1)
+					Try(Controller->Get<UObject*>(ControllerPlaysetOffset), "the thrower's selection");
+			}
+
+			if (ControllerClass)
+				Controllers.Free();
+		}
+
+		if (!UsePlayset)
+		{
+			LOG_WARN(LogCreative, "Thrown prefab: no playset known for {} yet, waiting for the next callback", Name);
+			continue;
+		}
+
 		AlreadyLoaded.insert(Name);
-		LOG_INFO(LogCreative, "Thrown prefab: loading {} into {} at {}", Playset->GetName(), Name, Where(Volume));
-		UFortPlaysetItemDefinition::ShowPlayset(Playset, Volume);
+		LOG_INFO(LogCreative, "Thrown prefab: loading {} (from {}) into {} at {}", UsePlayset->GetName(), Source, Name, Where(Volume));
+		UFortPlaysetItemDefinition::ShowPlayset(UsePlayset, Volume);
 		CallOnRep(Volume, "OnRep_VolumeState");
 		++Loaded;
 	}
