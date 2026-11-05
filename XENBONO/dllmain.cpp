@@ -699,9 +699,9 @@ void ChangeLevels()
         ? L"Athena_Terrain" : Engine_Version >= 500 ? Fortnite_Version >= 23
         ? L"Asteria_Terrain"
         : Globals::bCreative ? L"Creative_NoApollo_Terrain"
-        : L"Artemis_Terrain"
+        : L"Creative_NoApollo_Terrain"
         : Globals::bCreative ? L"Creative_NoApollo_Terrain"
-        : L"Apollo_Terrain");
+        : L"Creative_NoApollo_Terrain");
 
     if (bShouldUseMoleMap) // erms
     {
