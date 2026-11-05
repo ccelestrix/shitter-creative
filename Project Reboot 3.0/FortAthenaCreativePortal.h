@@ -66,7 +66,8 @@ public:
 
 		if (!IslandInfo)
 		{
-			return *(FString*)0;
+			static FString NoCreator; // never dereference null; callers just see an empty name
+			return NoCreator;
 		}
 
 		static auto CreatorNameOffset = FindOffsetStruct("/Script/FortniteGame.CreativeLoadedLinkData", "CreatorName");

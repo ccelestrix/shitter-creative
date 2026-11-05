@@ -1498,7 +1498,8 @@ static inline void PregameUI()
 {
 	StaticUI();
 
-	if (Engine_Version >= 422 && Engine_Version < 424)
+	// 4.22-4.23 (S9-S10) and 4.24 (11.x-12.x, includes 12.41) have the creative hub.
+	if (Engine_Version >= 422 && Engine_Version <= 424)
 	{
 		ImGui::Checkbox("Creative", &Globals::bCreative);
 	}
@@ -1562,15 +1563,15 @@ static inline HICON LoadIconFromMemory(const char* bytes, int bytes_size, const 
 
 static inline DWORD WINAPI GuiThread(LPVOID)
 {
-	WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(NULL), NULL, NULL, NULL, NULL, L"RebootClass", NULL };
+	WNDCLASSEX wc = { sizeof(WNDCLASSEX), CS_CLASSDC, WndProc, 0L, 0L, GetModuleHandle(NULL), NULL, NULL, NULL, NULL, L"XenbonoClass", NULL };
 	::RegisterClassEx(&wc);
 
-	HWND hwnd = ::CreateWindowExW(0L,wc.lpszClassName,(L"Project Reboot " + ([](double v) { std::wstringstream ss; ss << std::fixed << std::setprecision(2) << v; return ss.str(); })(Fortnite_Version)).c_str(),(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX), 100, 100, Width, Height, NULL, NULL, wc.hInstance, NULL);
+	HWND hwnd = ::CreateWindowExW(0L,wc.lpszClassName,(L"XENBONO " + ([](double v) { std::wstringstream ss; ss << std::fixed << std::setprecision(2) << v; return ss.str(); })(Fortnite_Version)).c_str(),(WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX), 100, 100, Width, Height, NULL, NULL, wc.hInstance, NULL);
 
 
 	if (hwnd == NULL)
 	{
-		MessageBoxA(0, ("Failed to create GUI window " + std::to_string(GetLastError()) + "!").c_str(), "Reboot 3.0", MB_ICONERROR);
+		MessageBoxA(0, ("Failed to create GUI window " + std::to_string(GetLastError()) + "!").c_str(), "XENBONO", MB_ICONERROR);
 		::UnregisterClass(wc.lpszClassName, wc.hInstance);
 		return 1;
 	}
@@ -1587,7 +1588,7 @@ static inline DWORD WINAPI GuiThread(LPVOID)
 	// Initialize Direct3D
 	if (!CreateDeviceD3D(hwnd))
 	{
-		// MessageBoxA(0, "Failed to create D3D Device!", "Reboot 3.0", MB_ICONERROR); // Error Boxes are within the helper function.
+		// MessageBoxA(0, "Failed to create D3D Device!", "XENBONO", MB_ICONERROR); // Error Boxes are within the helper function.
 		LOG_ERROR(LogDev, "Failed to create D3D Device!");
 		CleanupDeviceD3D();
 		::UnregisterClass(wc.lpszClassName, wc.hInstance);
@@ -1662,7 +1663,7 @@ static inline DWORD WINAPI GuiThread(LPVOID)
 
 		if (!ImGui::IsWindowCollapsed())
 		{
-			ImGui::Begin("Project Reboot 3.0", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
+			ImGui::Begin("XENBONO", nullptr, ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoTitleBar);
 
 			Globals::bInitializedPlaylist ? MainUI() : PregameUI();
 
@@ -1711,7 +1712,7 @@ static inline bool CreateDeviceD3D(HWND hWnd)
 	g_pD3D = Direct3DCreate9(D3D_SDK_VERSION);
 	if (g_pD3D == NULL)
 	{
-		MessageBoxA(0, "Failed call to Direct3DCreate9!", "Reboot 3.0", MB_ICONERROR);
+		MessageBoxA(0, "Failed call to Direct3DCreate9!", "XENBONO", MB_ICONERROR);
 		return false;
 	}
 
@@ -1737,7 +1738,7 @@ static inline bool CreateDeviceD3D(HWND hWnd)
 	}
 	else if (CreateDeviceResult < D3D_OK)
 	{
-		MessageBoxA(0, ("Failed call to CreateDevice " + std::to_string(CreateDeviceResult) + "!").c_str(), "Reboot 3.0", MB_ICONERROR);
+		MessageBoxA(0, ("Failed call to CreateDevice " + std::to_string(CreateDeviceResult) + "!").c_str(), "XENBONO", MB_ICONERROR);
 
 		return false;
 	}

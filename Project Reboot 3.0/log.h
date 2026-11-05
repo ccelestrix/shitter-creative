@@ -55,7 +55,7 @@ inline void InitLogger()
         freopen_s(&stream, "err.txt", "w", stderr);
     }
 
-    SetConsoleTitleA("Project Reboot 3.0");
+    SetConsoleTitleA("XENBONO");
     
 #ifdef ENABLE_SPD_LOG
 

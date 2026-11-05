@@ -922,7 +922,7 @@ DWORD WINAPI Main(LPVOID)
 
     std::cout << std::format("Base Address: 0x{:x}\n", __int64(GetModuleHandleW(0)));
 
-    LOG_INFO(LogInit, "Initializing Project Reboot!");
+    LOG_INFO(LogInit, "Initializing XENBONO!");
     LOG_INFO(LogDev, "Built on {} {}", __DATE__, __TIME__);
 
 #endif 
@@ -963,14 +963,14 @@ DWORD WINAPI Main(LPVOID)
 #ifdef ABOVE_S20
     if (Fortnite_Version < 20)
     {
-        MessageBoxA(0, "Please undefine ABOVE_S20", "Project Reboot 3.0", MB_ICONERROR);
+        MessageBoxA(0, "Please undefine ABOVE_S20", "XENBONO", MB_ICONERROR);
         LOG_ERROR(LogDev, "Aborting!");
         return 0;
     }
 #else
     if (Fortnite_Version > 20)
     {
-        MessageBoxA(0, "Please define ABOVE_S20 (compile it yourself and change inc.h)", "Project Reboot 3.0", MB_ICONERROR);
+        MessageBoxA(0, "Please define ABOVE_S20 (compile it yourself and change inc.h)", "XENBONO", MB_ICONERROR);
         LOG_ERROR(LogDev, "Aborting!");
         return 0;
     }

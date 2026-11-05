@@ -22,6 +22,18 @@ void UFortPlaysetItemDefinition::ShowPlayset(UFortPlaysetItemDefinition* Playset
 
 	return; */
 
+	if (!LoadPlaysetOriginal)
+	{
+		LOG_ERROR(LogCreative, "LoadPlayset was not found for this version, so the island playset cannot be loaded!");
+		return;
+	}
+
+	if (!PlaysetItemDef || !Volume)
+	{
+		LOG_ERROR(LogCreative, "ShowPlayset needs a playset ({}) and a volume ({})!", __int64(PlaysetItemDef), __int64(Volume));
+		return;
+	}
+
 	auto VolumeToUse = Volume;
 
 	static auto PlaysetLevelStreamComponentClass = FindObject<UClass>("/Script/FortniteGame.PlaysetLevelStreamComponent");

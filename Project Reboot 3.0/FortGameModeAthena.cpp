@@ -1642,7 +1642,15 @@ void AFortGameModeAthena::Athena_HandleStartingNewPlayerHook(AFortGameModeAthena
 		PlayerCameraManager->Get<float>(ViewRollMaxOffset) = 0;
 	}
 
-	if (Globals::bCreative)
+	if (Globals::bCreative && ([&]() {
+			static auto ManagerOffset = GameState->GetOffset("CreativePortalManager");
+
+			if (GameState->Get(ManagerOffset))
+				return true;
+
+			LOG_ERROR(LogCreative, "The game state has no CreativePortalManager, so {} gets no island!", NewPlayer->GetName());
+			return false;
+		})())
 	{
 		static auto CreativePortalManagerOffset = GameState->GetOffset("CreativePortalManager");
 		auto CreativePortalManager = GameState->Get(CreativePortalManagerOffset);

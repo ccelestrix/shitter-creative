@@ -230,7 +230,7 @@ public:
 		if (Fortnite_Version < 9)
 		{
 			BotNumWStr = std::to_wstring(CurrentBotNum++);
-			NewName = (L"RebootBot" + BotNumWStr).c_str();
+			NewName = (L"XenbonoBot" + BotNumWStr).c_str();
 		}
 		else
 		{
