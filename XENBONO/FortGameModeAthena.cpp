@@ -312,6 +312,147 @@ void SetupEverythingAI() // find better name lol
 	// SetupNavConfig(UKismetStringLibrary::Conv_StringToName(L"MANG"));
 }
 
+// While the server waits for the creative hub's player starts it says, every few seconds, what the world's streaming levels are doing (the hub is
+// a streamed level, and if it never loads the server never becomes joinable). A hub level that exists but is not loading is asked to load again,
+// and if no streaming level for the hub exists at all the playlist's levels are requested once more.
+static ULONGLONG HubWaitingSince = 0;
+
+static void ReportWaitingForHub(AFortGameStateAthena* GameState)
+{
+	static ULONGLONG LastReport = 0;
+	static int Reports = 0;
+	static bool bNudged = false;
+	static bool bRequestedAgain = false;
+
+	const ULONGLONG Now = GetTickCount64();
+
+	if (!HubWaitingSince)
+		HubWaitingSince = Now;
+
+	const ULONGLONG Waited = Now - HubWaitingSince;
+	const bool bReport = Now - LastReport >= 4000 && Reports < 20;
+
+	if (!bReport && (bNudged || Waited < 12000) && (bRequestedAgain || Waited < 25000))
+		return;
+
+	if (bReport)
+	{
+		LastReport = Now;
+		++Reports;
+	}
+
+	auto World = GetWorld();
+	static auto StreamingOffset = World->GetOffset("StreamingLevels", false);
+
+	if (StreamingOffset == -1)
+	{
+		if (bReport)
+			LOG_WARN(LogCreative, "Waiting for the creative hub ({} s): the world has no StreamingLevels property", (int)(Waited / 1000));
+
+		return;
+	}
+
+	auto& Levels = World->Get<TArray<UObject*>>(StreamingOffset);
+	bool bHubLevelExists = false;
+	std::string Summary;
+
+	for (int i = 0; i < Levels.Num() && i < 30; ++i)
+	{
+		auto Level = Levels.at(i);
+
+		if (!Level)
+			continue;
+
+		static auto WorldAssetOffset = Level->GetOffset("WorldAsset", false);
+		static auto FlagsOffset = Level->GetOffset("bShouldBeLoaded", false); // the byte that holds bShouldBeVisible (bit 3) and bShouldBeLoaded (bit 4)
+		static auto LoadedLevelOffset = Level->GetOffset("LoadedLevel", false);
+
+		std::string Path = Level->GetName();
+
+		if (WorldAssetOffset != -1)
+		{
+			auto& Asset = Level->Get<TSoftObjectPtr<UObject>>(WorldAssetOffset);
+
+			if (Asset.IsValid())
+				Path = Asset.SoftObjectPtr.ObjectID.AssetPathName.ToString();
+		}
+
+		auto Ask = [&](const char* Function) -> int {
+			struct { bool ReturnValue; } Params{ false };
+
+			if (auto Fn = Level->FindFunction(Function))
+			{
+				Level->ProcessEvent(Fn, &Params);
+				return Params.ReturnValue ? 1 : 0;
+			}
+
+			return -1;
+		};
+
+		const int Loaded = Ask("IsLevelLoaded");
+		const int Visible = Ask("IsLevelVisible");
+		const int Pending = Ask("IsStreamingStatePending");
+		const int Flags = FlagsOffset == -1 ? -1 : (int)*(unsigned char*)((char*)Level + FlagsOffset);
+		const bool bHub = Path.find("CreativeHub") != std::string::npos || Path.find("CP_Island") != std::string::npos || Path.find("Apollo_CP_Boundary") != std::string::npos;
+
+		bHubLevelExists = bHubLevelExists || bHub;
+
+		if (bReport)
+			Summary += std::format("\n  {}{}: loaded {}, visible {}, pending {}, shouldBeLoaded {}, shouldBeVisible {}, loaded level {}", bHub ? "[creative] " : "", Path, Loaded, Visible, Pending, Flags == -1 ? -1 : (Flags >> 4) & 1,
+				Flags == -1 ? -1 : (Flags >> 3) & 1, LoadedLevelOffset == -1 ? "n/a" : (Level->Get<UObject*>(LoadedLevelOffset) ? "yes" : "no"));
+
+		// A hub level that exists but is not loading is asked to load.
+		if (bHub && !bNudged && Waited >= 12000 && Loaded == 0)
+		{
+			if (auto Fn = Level->FindFunction("SetShouldBeLoaded")) { bool b = true; Level->ProcessEvent(Fn, &b); }
+			if (auto Fn = Level->FindFunction("SetShouldBeVisible")) { bool b = true; Level->ProcessEvent(Fn, &b); }
+			LOG_WARN(LogCreative, "Waiting for the creative hub: {} was not loaded after {} s, asked it to load and become visible", Path, (int)(Waited / 1000));
+		}
+	}
+
+	if (Waited >= 12000)
+		bNudged = true;
+
+	if (bReport)
+	{
+		auto StartCreativeClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStartCreative");
+		auto Starts = StartCreativeClass ? UGameplayStatics::GetAllActorsOfClass(GetWorld(), StartCreativeClass) : TArray<AActor*>();
+		const int StartCount = Starts.Num();
+
+		if (StartCreativeClass)
+			Starts.Free();
+
+		LOG_INFO(LogCreative, "Waiting for the creative hub ({} s): {} FortPlayerStartCreative actors, {} streaming levels{}", (int)(Waited / 1000), StartCount, Levels.Num(), Summary);
+	}
+
+	// No streaming level for the hub was ever created: the request made when the playlist was set up was lost, make it again (once).
+	if (Waited >= 25000 && !bRequestedAgain && !bHubLevelExists)
+	{
+		bRequestedAgain = true;
+
+		GET_PLAYLIST(GameState);
+
+		if (CurrentPlaylist)
+		{
+			static auto AdditionalLevelsOffset = CurrentPlaylist->GetOffset("AdditionalLevels", false);
+
+			if (AdditionalLevelsOffset != -1)
+			{
+				auto& AdditionalLevels = CurrentPlaylist->Get<TArray<TSoftObjectPtr<UWorld>>>(AdditionalLevelsOffset);
+				LOG_WARN(LogCreative, "Waiting for the creative hub: no streaming level for it exists after {} s, requesting the playlist's {} levels again", (int)(Waited / 1000), AdditionalLevels.Num());
+
+				for (int i = 0; i < AdditionalLevels.Num(); i++)
+					GameState->AddToAdditionalPlaylistLevelsStreamed(AdditionalLevels.at(i).SoftObjectPtr.ObjectID.AssetPathName);
+
+				static auto OnRepFn = FindObject<UFunction>(L"/Script/FortniteGame.FortGameState.OnRep_AdditionalPlaylistLevelsStreamed");
+
+				if (OnRepFn)
+					GameState->ProcessEvent(OnRepFn);
+			}
+		}
+	}
+}
+
 bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* GameMode)
 {
 	Globals::bHitReadyToStartMatch = true;
@@ -732,8 +873,27 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 
 	if (bIsAthenaMap)
 	{
-		static auto FortPlayerStartCreativeClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStartCreative");
-		static auto FortPlayerStartWarmupClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStartWarmup");
+		// Looked up again until found: a class that was not found once must not stay "not found" (the server would count no player starts forever).
+		static UClass* FortPlayerStartCreativeClass = nullptr;
+		static UClass* FortPlayerStartWarmupClass = nullptr;
+
+		if (!FortPlayerStartCreativeClass)
+			FortPlayerStartCreativeClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStartCreative");
+
+		if (!FortPlayerStartWarmupClass)
+			FortPlayerStartWarmupClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStartWarmup");
+
+		if (IsCreativeGame() ? !FortPlayerStartCreativeClass : !FortPlayerStartWarmupClass)
+		{
+			static bool bLoggedNoClass = false;
+
+			if (!bLoggedNoClass)
+			{
+				bLoggedNoClass = true;
+				LOG_ERROR(LogCreative, "The {} class was not found, so the number of player starts cannot be counted", IsCreativeGame() ? "FortPlayerStartCreative" : "FortPlayerStartWarmup");
+			}
+		}
+
 		TArray<AActor*> Actors = UGameplayStatics::GetAllActorsOfClass(GetWorld(), IsCreativeGame() ? FortPlayerStartCreativeClass : FortPlayerStartWarmupClass);
 
 		int ActorsNum = Actors.Num();
@@ -750,7 +910,16 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 				LOG_WARN(LogCreative, "Not ready to start: there are no {} actors in the map", IsCreativeGame() ? "FortPlayerStartCreative" : "FortPlayerStartWarmup");
 			}
 
+			if (IsCreativeGame())
+				ReportWaitingForHub(GameState);
+
 			return false;
+		}
+
+		if (HubWaitingSince)
+		{
+			LOG_INFO(LogCreative, "The player starts exist now, the server waited {} s for them", (int)((GetTickCount64() - HubWaitingSince) / 1000));
+			HubWaitingSince = 0;
 		}
 	}
 	
