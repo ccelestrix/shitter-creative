@@ -674,9 +674,37 @@ void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 		}
 
 		AlreadyLoaded.insert(Name);
-		LOG_INFO(LogCreative, "Thrown prefab: loading {} (from {}) into {} at {}", UsePlayset->GetName(), Source, Name, Where(Volume));
-		UFortPlaysetItemDefinition::ShowPlayset(UsePlayset, Volume);
-		CallOnRep(Volume, "OnRep_VolumeState");
+		LOG_INFO(LogCreative, "Thrown prefab: {} (playset {} from {}) at {} is in state {}; asking the volume manager to activate queued volumes", Name, UsePlayset->GetName(), Source, Where(Volume), (int)Volume->GetVolumeState());
+
+		// The prefab volume has no stream component of its own and starts Uninitialized (0): the game activates such volumes from the volume manager's
+		// queue (TryActivateQueuedVolumes). Nothing is forced on the volume here, in earlier tests forcing it was followed by a crash.
+		static auto ManagerClass = FindObject<UClass>(L"/Script/FortniteGame.FortVolumeManager");
+		static auto GameStateClass = FindObject<UClass>(L"/Script/FortniteGame.FortGameStateAthena");
+
+		auto Managers = ManagerClass ? UGameplayStatics::GetAllActorsOfClass(GetWorld(), ManagerClass) : TArray<AActor*>();
+		auto States = GameStateClass ? UGameplayStatics::GetAllActorsOfClass(GetWorld(), GameStateClass) : TArray<AActor*>();
+
+		if (Managers.Num() > 0 && States.Num() > 0)
+		{
+			auto Manager = Managers.at(0);
+			auto GameState = States.at(0);
+
+			static auto GamePhaseOffset = GameState->GetOffset("GamePhase", false);
+			const uint8_t Phase = GamePhaseOffset == -1 ? 0 : GameState->Get<uint8_t>(GamePhaseOffset);
+
+			if (auto ActivateFn = Manager->FindFunction("TryActivateQueuedVolumes"))
+			{
+				Manager->ProcessEvent(ActivateFn, (void*)&Phase);
+				LOG_INFO(LogCreative, "Thrown prefab: TryActivateQueuedVolumes(game phase {}) called; {} is now in state {}", (int)Phase, Name, (int)Volume->GetVolumeState());
+			}
+			else
+				LOG_WARN(LogCreative, "Thrown prefab: the volume manager has no TryActivateQueuedVolumes");
+		}
+		else
+			LOG_WARN(LogCreative, "Thrown prefab: no volume manager ({}) or game state ({}) found", Managers.Num(), States.Num());
+
+		if (ManagerClass) Managers.Free();
+		if (GameStateClass) States.Free();
 		++Loaded;
 	}
 
@@ -740,6 +768,39 @@ void CreativeIsland::LogBudget(const char* Why, int MaxTimes)
 
 	if (!ControllerClass || !TrackingClass)
 		return;
+
+	// Where the per-asset costs come from: the volume manager points at a cost directory asset. If it is not loaded, nothing has a cost.
+	{
+		static auto ManagerClass = FindObject<UClass>(L"/Script/FortniteGame.FortVolumeManager");
+		static bool bTriedLoad = false;
+
+		auto Managers = ManagerClass ? UGameplayStatics::GetAllActorsOfClass(GetWorld(), ManagerClass) : TArray<AActor*>();
+
+		if (Managers.Num() > 0)
+		{
+			auto Manager = Managers.at(0);
+			static auto CostDirectoryOffset = Manager->GetOffset("AssetCostDirectory", false);
+
+			if (CostDirectoryOffset != -1)
+			{
+				auto& CostDirectory = Manager->Get<TSoftObjectPtr<UObject>>(CostDirectoryOffset);
+				const bool bSet = CostDirectory.IsValid();
+				auto Loaded = bSet ? CostDirectory.Get() : nullptr;
+
+				if (bSet && !Loaded && !bTriedLoad)
+				{
+					bTriedLoad = true;
+					Loaded = CostDirectory.Get(FindObject<UClass>(L"/Script/FortniteGame.CreativeAssetCostDirectory"), true);
+					LOG_INFO(LogCreative, "Budget: the cost directory was not loaded, tried to load it: {}", Loaded ? "loaded" : "failed");
+				}
+
+				LOG_INFO(LogCreative, "Budget ({}): AssetCostDirectory is {}, {}", Why, bSet ? CostDirectory.SoftObjectPtr.ObjectID.AssetPathName.ToString() : std::string("not set"), Loaded ? "loaded (" + Loaded->GetName() + ")" : std::string("NOT loaded"));
+			}
+		}
+
+		if (ManagerClass)
+			Managers.Free();
+	}
 
 	auto Controllers = UGameplayStatics::GetAllActorsOfClass(GetWorld(), ControllerClass);
 
