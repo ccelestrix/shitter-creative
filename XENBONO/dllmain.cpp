@@ -1644,6 +1644,8 @@ DWORD WINAPI Main(LPVOID)
     Hooking::MinHook::Hook(FortAthenaCreativePortalDefault, FindObject<UFunction>(L"/Script/FortniteGame.FortAthenaCreativePortal.TeleportPlayer"),
         AFortAthenaCreativePortal::TeleportPlayerHook, (PVOID*)&AFortAthenaCreativePortal::TeleportPlayerOriginal, false, true);
 
+    CreativeIsland::HookControllerFunctions();
+
     LOG_INFO(LogCreative, "XENBONO Creative report: Fortnite {} (engine {}), creative mode {}", Fortnite_Version, Engine_Version, Globals::bCreative);
     LOG_INFO(LogCreative, "Creative playlist: {}", FindObject<UObject>(L"/Game/Athena/Playlists/Creative/Playlist_PlaygroundV2.Playlist_PlaygroundV2") ? "found" : "NOT FOUND");
     LOG_INFO(LogCreative, "Default__FortAthenaCreativePortal: {}", FortAthenaCreativePortalDefault ? "found" : "NOT FOUND");

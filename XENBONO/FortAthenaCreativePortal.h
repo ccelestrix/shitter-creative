@@ -78,3 +78,21 @@ public:
 	static void TeleportPlayerHook(UObject* Context, FFrame& Stack, void* Ret);
 	// hook TeleportPlayer ?? but do what with it
 };
+
+// What making an island needs on 12.41, taken from how the Xenon game server does it (checked against the 12.41 SDK).
+class AFortPlayerControllerAthena;
+class UFortPlaysetItemDefinition;
+
+namespace CreativeIsland
+{
+	/** Calls a function with no parameters (an OnRep_ normally) so clients see the change; logs when it does not exist on this version. */
+	void CallOnRep(UObject* Object, const std::string& FunctionName);
+	/** The plot a new island starts as ("Temperate Island", the first one in the Select Type screen). */
+	UObject* FindPlot();
+	/** The playset (island layout) a plot starts from. */
+	UFortPlaysetItemDefinition* GetPlotPlayset(UObject* Plot);
+	/** Gives the player the creative phone if they do not have it yet. */
+	void GiveCreativePhone(AFortPlayerControllerAthena* Controller);
+	/** Logs every creative call the client makes to the server, and handles picking an island type (ServerSetPlayset). */
+	void HookControllerFunctions();
+}

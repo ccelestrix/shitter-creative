@@ -19,3 +19,11 @@ None of this has been run against a 12.41 client. To find what breaks next, star
 ## Logs
 - `xenbono.log`: every line from every logger, written straight to disk in the game's working directory (falls back to the exe folder, the DLL folder, then temp if that folder is not writable). The first line says which folder was used.
 - `xenbono_creative.log`: only the Creative lines (`LogCreative`), written next to the game executable. It starts with a report of which Creative functions and addresses were found, then logs island setup, the hub teleport, portal teleports and creative item requests.
+
+## Island creation (ported from the Xenon server, checked against the 12.41 SDK)
+- A new island starts as the `Temperate_Medium` plot (the first one on the Select Type screen) and its playset.
+- The level save component is told the plot is the player's, loaded from the plot, and public. Without that the client says creating and saving islands does not work.
+- The portal, island volume and controller now call their `OnRep_` functions so clients see the change (the loading screen and the island appearing come from these).
+- Entering the island gives the creative phone, links the volume to the player and drops them in from the sky (Z 10000, then `BeginSkydiving`).
+- Every creative `Server*` call the client makes (claim/release portal, load/save checkpoint, load plot, set playset, ...) is logged to `xenbono_creative.log`. Picking a layout (`ServerSetPlayset`) loads that playset into the island.
+- Still missing: saving and loading real island contents.

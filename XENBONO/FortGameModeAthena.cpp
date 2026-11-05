@@ -1728,6 +1728,18 @@ void AFortGameModeAthena::Athena_HandleStartingNewPlayerHook(AFortGameModeAthena
 
 			Portal->GetInErrorState() = false;
 
+			// The clients only learn about these changes through their OnRep_ functions, without them the portal looks unclaimed.
+			static auto bIsPublishedPortalOffset = Portal->GetOffset("bIsPublishedPortal", false);
+
+			if (bIsPublishedPortalOffset != -1)
+			{
+				Portal->Get<bool>(bIsPublishedPortalOffset) = false;
+				CreativeIsland::CallOnRep(Portal, "OnRep_PublishedPortal");
+			}
+
+			CreativeIsland::CallOnRep(Portal, "OnRep_OwningPlayer");
+			CreativeIsland::CallOnRep(Portal, "OnRep_PortalOpen");
+
 			static auto OwnedPortalOffset = NewPlayer->GetOffset("OwnedPortal");
 			NewPlayer->Get<AFortAthenaCreativePortal*>(OwnedPortalOffset) = Portal;
 
@@ -1739,7 +1751,15 @@ void AFortGameModeAthena::Athena_HandleStartingNewPlayerHook(AFortGameModeAthena
 
 			Portal->GetLinkedVolume()->GetVolumeState() = EVolumeState::Ready;
 
-			static auto IslandPlayset = FindObject<UFortPlaysetItemDefinition>("/Game/Playsets/PID_Playset_60x60_Composed.PID_Playset_60x60_Composed");
+			// A new island starts as the first plot in the Select Type screen (Temperate Island), like the Xenon server does.
+			static auto IslandPlot = CreativeIsland::FindPlot();
+			static auto IslandPlayset = ([&]() -> UFortPlaysetItemDefinition* {
+				if (auto PlotPlayset = CreativeIsland::GetPlotPlayset(IslandPlot))
+					return PlotPlayset;
+
+				LOG_WARN(LogCreative, "Using the old 60x60 playset because the plot has none");
+				return FindObject<UFortPlaysetItemDefinition>("/Game/Playsets/PID_Playset_60x60_Composed.PID_Playset_60x60_Composed");
+			})();
 
 			if (auto Volume = NewPlayer->GetCreativePlotLinkedVolume())
 			{
@@ -1760,10 +1780,42 @@ void AFortGameModeAthena::Athena_HandleStartingNewPlayerHook(AFortGameModeAthena
 
 					static auto bIsLoadedOffset = LevelSaveComponent->GetOffset("bIsLoaded");
 					LevelSaveComponent->Get<bool>(bIsLoadedOffset) = true;
+
+					// Tell the save component the plot is the player's, loaded from the plot, and open to build in. Without this the
+					// client reports that creating and saving islands does not work.
+					static auto RestrictedPlotDefinitionOffset = LevelSaveComponent->GetOffset("RestrictedPlotDefinition", false);
+					static auto bLoadPlaysetFromPlotOffset = LevelSaveComponent->GetOffset("bLoadPlaysetFromPlot", false);
+					static auto bAutoLoadFromRestrictedPlotDefinitionOffset = LevelSaveComponent->GetOffset("bAutoLoadFromRestrictedPlotDefinition", false);
+					static auto PlotPermissionsOffset = LevelSaveComponent->GetOffset("PlotPermissions", false);
+
+					if (RestrictedPlotDefinitionOffset != -1 && IslandPlot && !LevelSaveComponent->Get<UObject*>(RestrictedPlotDefinitionOffset))
+					{
+						LevelSaveComponent->Get<UObject*>(RestrictedPlotDefinitionOffset) = IslandPlot;
+
+						if (bLoadPlaysetFromPlotOffset != -1)
+							LevelSaveComponent->Get<bool>(bLoadPlaysetFromPlotOffset) = true;
+
+						if (bAutoLoadFromRestrictedPlotDefinitionOffset != -1)
+							LevelSaveComponent->Get<bool>(bAutoLoadFromRestrictedPlotDefinitionOffset) = true;
+
+						if (PlotPermissionsOffset != -1)
+							LevelSaveComponent->Get<uint8_t>(PlotPermissionsOffset) = 1; // EFortCreativePlotPermission::Public
+
+						CreativeIsland::CallOnRep(LevelSaveComponent, "OnRep_AccountIdOfOwner");
+						LOG_INFO(LogCreative, "Level save component set up with the plot {}", IslandPlot->GetName());
+					}
+					else
+					{
+						LOG_WARN(LogCreative, "Level save component was not set up: RestrictedPlotDefinition offset {}, plot {}", RestrictedPlotDefinitionOffset, __int64(IslandPlot));
+					}
 				}
 			}
 
 			UFortPlaysetItemDefinition::ShowPlayset(IslandPlayset, Portal->GetLinkedVolume());
+
+			// Now the island is loaded, tell the clients (the loading screen and the island appearing both come from these).
+			CreativeIsland::CallOnRep(Portal->GetLinkedVolume(), "OnRep_VolumeState");
+			CreativeIsland::CallOnRep(NewPlayer, "OnRep_CreativePlotLinkedVolume");
 
 			LOG_INFO(LogCreative, "Initialized player portal!");
 		}
