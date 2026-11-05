@@ -900,6 +900,14 @@ void AFortPlayerController::ServerCreateBuildingActorHook(UObject* Context, FFra
 
 	LOG_INFO(LogCreative, "ServerCreateBuildingActor: {} wants {} at {} {} {}", PlayerController->GetName(), BuildingClass->GetName(), BuildLocation.X, BuildLocation.Y, BuildLocation.Z);
 
+	// In Creative the game's own handler places the piece: it knows about the island grid and volume, and plays the build animation.
+	// Placing it here as well gave ghost builds, doubled pieces and no animation.
+	if (IsCreativeGame())
+	{
+		LOG_INFO(LogCreative, "ServerCreateBuildingActor: Creative, the game places the piece itself");
+		return ServerCreateBuildingActorOriginal(Context, Stack, Ret);
+	}
+
 	auto GameState = Cast<AFortGameStateAthena, false>(Cast<AFortGameMode, false>(GetWorld()->GetGameMode())->GetGameState());
 
 	auto StructuralSupportSystem = GameState->GetStructuralSupportSystem();

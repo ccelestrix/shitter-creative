@@ -189,6 +189,60 @@ void CreativeIsland::GiveCreativePhone(AFortPlayerControllerAthena* Controller)
 	CallOnRep(Controller, "ClientCreativePhoneCreated");
 }
 
+void CreativeIsland::SetupSettingsMachine(AFortVolume* Volume)
+{
+	if (!Volume)
+		return;
+
+	static auto MachineClass = FindObject<UClass>(L"/Game/Athena/Items/Gameplay/MinigameSettingsControl/MinigameSettingsMachine.MinigameSettingsMachine_C");
+	static auto MinigameVolumeComponentClass = FindObject<UClass>(L"/Script/FortniteGame.FortMinigameVolumeComponent");
+	static auto CreativeLinkComponentClass = FindObject<UClass>(L"/Script/FortniteGame.FortCreativeVolumeLinkComponent");
+
+	if (!MachineClass)
+	{
+		LOG_WARN(LogCreative, "MinigameSettingsMachine_C was not found, so the island has no settings and Start Game cannot work");
+		return;
+	}
+
+	auto VolumeComponent = MinigameVolumeComponentClass ? (UObject*)Volume->GetComponentByClass(MinigameVolumeComponentClass) : nullptr;
+	auto LinkComponent = CreativeLinkComponentClass ? (UObject*)Volume->GetComponentByClass(CreativeLinkComponentClass) : nullptr;
+
+	LOG_INFO(LogCreative, "Island volume components: minigame volume {}, creative link {}", __int64(VolumeComponent), __int64(LinkComponent));
+
+	static auto CurrentMachineOffset = VolumeComponent ? VolumeComponent->GetOffset("CurrentMinigameSettingsMachine", false) : -1;
+
+	if (VolumeComponent && CurrentMachineOffset != -1 && VolumeComponent->Get<UObject*>(CurrentMachineOffset))
+	{
+		LOG_INFO(LogCreative, "The island already has a settings machine");
+		return;
+	}
+
+	auto Machine = GetWorld()->SpawnActor<AActor>(MachineClass, Volume->GetActorLocation());
+
+	if (!Machine)
+	{
+		LOG_ERROR(LogCreative, "Spawning the settings machine failed");
+		return;
+	}
+
+	LOG_INFO(LogCreative, "Spawned the settings machine {}", Machine->GetName());
+
+	static auto SettingsVolumeOffset = Machine->GetOffset("SettingsVolume", false);
+	static auto MachineLinkOffset = Machine->GetOffset("CreativeLinkComponent", false);
+
+	if (SettingsVolumeOffset != -1)
+	{
+		Machine->Get<AFortVolume*>(SettingsVolumeOffset) = Volume;
+		CallOnRep(Machine, "OnRep_SettingsVolume");
+	}
+
+	if (MachineLinkOffset != -1 && LinkComponent)
+		Machine->Get<UObject*>(MachineLinkOffset) = LinkComponent;
+
+	if (VolumeComponent && CurrentMachineOffset != -1)
+		VolumeComponent->Get<UObject*>(CurrentMachineOffset) = Machine;
+}
+
 // One logging pass-through per creative function the client can call. The client's call is not touched, it only gets written down,
 // so after a run the log shows what the Select Type / Confirm buttons actually ask the server to do.
 #define XENBONO_CREATIVE_LOG_HOOK(Name)                                                                                      \

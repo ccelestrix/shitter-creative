@@ -93,6 +93,8 @@ namespace CreativeIsland
 	UFortPlaysetItemDefinition* GetPlotPlayset(UObject* Plot);
 	/** Gives the player the creative phone if they do not have it yet. */
 	void GiveCreativePhone(AFortPlayerControllerAthena* Controller);
-	/** Logs every creative call the client makes to the server, and handles picking an island type (ServerSetPlayset). */
+	/** Spawns the island's settings machine (what My Island > Settings / UI and Start Game read), if the island has none yet. */
+	void SetupSettingsMachine(class AFortVolume* Volume);
+	/** Logs every creative call the client makes to the server. */
 	void HookControllerFunctions();
 }
