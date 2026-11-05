@@ -720,6 +720,267 @@ void CreativeIsland::TickProbes()
 	}
 }
 
+// How many entries a TMap holds, from its raw memory: TSparseArray { TArray Data (+0), TBitArray AllocationFlags (+0x10), FirstFreeIndex (+0x30), NumFreeIndices (+0x34) }.
+static int MapCount(const char* Map)
+{
+	if (!Readable(Map, 0x38))
+		return -1;
+
+	return *(const int*)(Map + 8) - *(const int*)(Map + 0x34);
+}
+
+// Index of the first allocated entry of a TMap (bit i of the allocation flags), or -1.
+static int FirstMapEntry(const char* Map)
+{
+	if (!Readable(Map, 0x38))
+		return -1;
+
+	const int Slots = *(const int*)(Map + 8);
+	const unsigned* Flags = (const unsigned*)(Map + 0x10); // inline storage of the first 128 bits
+
+	for (int i = 0; i < Slots && i < 128; ++i)
+		if (Flags[i / 32] & (1u << (i % 32)))
+			return i;
+
+	return -1;
+}
+
+// What a saved record (the thing a prefab's props are stored as) contains, as far as the SDK shows it, plus raw bytes of its first entries so the
+// layout of the opaque actor records can be worked out from the log.
+static void DescribeRecord(const std::string& Label, UObject* Record)
+{
+	if (!Record)
+	{
+		LOG_INFO(LogCreative, "{}: no record", Label);
+		return;
+	}
+
+	static auto PackageOffset = Record->GetOffset("PackageName", false);
+	static auto VersionOffset = Record->GetOffset("SaveVersion", false);
+	static auto CenterOffset = Record->GetOffset("Center", false);
+	static auto HalfBoundsOffset = Record->GetOffset("HalfBoundsExtent", false);
+	static auto RotationOffset = Record->GetOffset("Rotation", false);
+	static auto ScaleOffset = Record->GetOffset("Scale", false);
+	static auto TemplatesOffset = Record->GetOffset("TemplateRecords", false);
+	static auto InstancesOffset = Record->GetOffset("ActorInstanceRecords", false);
+	static auto VolumeInfoOffset = Record->GetOffset("VolumeInfoActorRecords", false);
+	static auto GridOffset = Record->GetOffset("bRequiresGridPlacement", false);
+	const char* Base = (const char*)Record;
+
+	LOG_INFO(LogCreative, "{}: {} package {}, version {}, center {}, half bounds {}, rotation {}, scale {}, needs grid {}", Label, Describe(Record), PackageOffset == -1 ? "n/a" : NameAt(Base + PackageOffset),
+		VersionOffset == -1 ? -1 : (int)*(const short*)(Base + VersionOffset), CenterOffset == -1 ? "n/a" : FloatsAt(Base + CenterOffset, 3), HalfBoundsOffset == -1 ? "n/a" : FloatsAt(Base + HalfBoundsOffset, 3),
+		RotationOffset == -1 ? "n/a" : FloatsAt(Base + RotationOffset, 3), ScaleOffset == -1 ? "n/a" : FloatsAt(Base + ScaleOffset, 3), GridOffset == -1 ? -1 : (int)*(const bool*)(Base + GridOffset));
+
+	LOG_INFO(LogCreative, "{}: {} templates, {} actor instances, {} volume info actors", Label, TemplatesOffset == -1 ? -1 : MapCount(Base + TemplatesOffset), InstancesOffset == -1 ? -1 : MapCount(Base + InstancesOffset),
+		VolumeInfoOffset == -1 ? -1 : MapCount(Base + VolumeInfoOffset));
+
+	// The first template and the first instance, as raw bytes (element sizes worked out from the SDK: instance 0x90, template 0x68).
+	if (TemplatesOffset != -1)
+	{
+		const char* Map = Base + TemplatesOffset;
+		const int First = FirstMapEntry(Map);
+
+		if (First >= 0 && Readable(Map, 8))
+			LogHex(Label + " template " + std::to_string(First), *(const char* const*)Map + (size_t)First * 0x68, 0x68);
+	}
+
+	if (InstancesOffset != -1)
+	{
+		const char* Map = Base + InstancesOffset;
+		const int First = FirstMapEntry(Map);
+
+		if (First >= 0 && Readable(Map, 8))
+			LogHex(Label + " instance " + std::to_string(First), *(const char* const*)Map + (size_t)First * 0x90, 0x90);
+	}
+}
+
+// The saved records of a playset's props: from the record collection (soft record, name, transform: 0x60 bytes each), or from the props themselves.
+static void PlaysetRecords(UFortPlaysetItemDefinition* Playset, std::vector<UObject*>& OutRecords, bool bLog)
+{
+	static auto CollectionOffset = Playset->GetOffset("PlaysetPropLevelSaveRecordCollection", false);
+	static auto PropsOffset = Playset->GetOffset("AssociatedPlaysetProps", false);
+	static auto UsePropsOffset = Playset->GetOffset("bUsePlaysetProps", false);
+	static auto RecordClass = FindObject<UClass>(L"/Script/FortniteGame.LevelSaveRecord");
+	static auto PropClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlaysetPropItemDefinition");
+
+	UObject* Collection = CollectionOffset == -1 ? nullptr : Playset->Get<UObject*>(CollectionOffset);
+	char* Items = nullptr;
+	int ItemCount = 0;
+
+	if (Collection)
+	{
+		static auto ItemsOffset = Collection->GetOffset("Items", false);
+
+		if (ItemsOffset != -1 && Readable((char*)Collection + ItemsOffset, 16))
+		{
+			Items = *(char**)((char*)Collection + ItemsOffset);
+			ItemCount = *(int*)((char*)Collection + ItemsOffset + 8);
+		}
+	}
+
+	char* Props = nullptr;
+	int PropCount = 0;
+
+	if (PropsOffset != -1 && Readable((char*)Playset + PropsOffset, 16))
+	{
+		Props = *(char**)((char*)Playset + PropsOffset);
+		PropCount = *(int*)((char*)Playset + PropsOffset + 8);
+	}
+
+	if (bLog)
+		LOG_INFO(LogCreative, "Prefab data: record collection {} with {} items, {} associated props, bUsePlaysetProps {}", Describe(Collection), ItemCount, PropCount, UsePropsOffset == -1 ? -1 : (int)((*(const unsigned char*)((char*)Playset + UsePropsOffset) >> 1) & 1));
+
+	// a) the collection's items
+	for (int i = 0; Items && i < ItemCount && i < 80; ++i)
+	{
+		char* Item = Items + (size_t)i * 0x60;
+
+		if (!Readable(Item, 0x60))
+			break;
+
+		auto& Soft = *(TSoftObjectPtr<UObject>*)Item;
+		const std::string Path = Soft.IsValid() ? Soft.SoftObjectPtr.ObjectID.AssetPathName.ToString() : std::string("not set");
+
+		if (bLog && i < 5)
+			LOG_INFO(LogCreative, "Prefab data: collection item {}: record {}, name {}, rotation {}, location {}, scale {}", i, Path, NameAt(Item + 0x28), FloatsAt(Item + 0x30, 4), FloatsAt(Item + 0x40, 3), FloatsAt(Item + 0x50, 3));
+
+		UObject* Record = Soft.IsValid() ? Soft.Get(RecordClass, true) : nullptr;
+
+		if (Record)
+			OutRecords.push_back(Record);
+		else if (bLog && i < 5)
+			LOG_WARN(LogCreative, "Prefab data: collection item {} could not be loaded", i);
+	}
+
+	// b) no collection: the props' own records
+	for (int i = 0; OutRecords.empty() && Props && i < PropCount && i < 80; ++i)
+	{
+		char* Entry = Props + (size_t)i * 0x28;
+
+		if (!Readable(Entry, 0x28))
+			break;
+
+		auto& Soft = *(TSoftObjectPtr<UObject>*)Entry;
+		UObject* Prop = Soft.IsValid() ? Soft.Get(PropClass, true) : nullptr;
+
+		if (bLog && i < 5)
+			LOG_INFO(LogCreative, "Prefab data: prop {}: {} -> {}", i, Soft.IsValid() ? Soft.SoftObjectPtr.ObjectID.AssetPathName.ToString() : std::string("not set"), Describe(Prop));
+
+		if (!Prop)
+			continue;
+
+		static auto RecordOffset = Prop->GetOffset("ActorSaveRecord", false);
+
+		if (RecordOffset != -1)
+			if (auto Record = Prop->Get<UObject*>(RecordOffset))
+				OutRecords.push_back(Record);
+	}
+}
+
+static UObject* FirstVolumeManager()
+{
+	static auto ManagerClass = FindObject<UClass>(L"/Script/FortniteGame.FortVolumeManager");
+
+	if (!ManagerClass)
+		return nullptr;
+
+	auto Managers = UGameplayStatics::GetAllActorsOfClass(GetWorld(), ManagerClass);
+	UObject* Found = Managers.Num() > 0 ? Managers.at(0) : nullptr;
+	Managers.Free();
+	return Found;
+}
+
+// Is the volume manager waiting for something that would keep it from activating a new volume? (Volumes are activated from its queue, and not
+// while islands are "loading": a counter the game's server code raises and lowers.)
+static void CheckVolumeManager(AFortVolume* Volume)
+{
+	auto Manager = FirstVolumeManager();
+
+	if (!Manager)
+	{
+		LOG_WARN(LogCreative, "Volume manager: none found");
+		return;
+	}
+
+	auto AreLoading = [&]() -> bool {
+		struct { bool ReturnValue; } Params{ false };
+
+		if (auto Fn = Manager->FindFunction("AreIslandsLoading"))
+			Manager->ProcessEvent(Fn, &Params);
+
+		return Params.ReturnValue;
+	};
+
+	static auto StartupOffset = Manager->GetOffset("bInSpawningStartup", false);
+	static auto ObjectsOffset = Manager->GetOffset("VolumeObjects", false);
+
+	int Registered = -1;
+	bool bContains = false;
+
+	if (ObjectsOffset != -1)
+	{
+		auto& Objects = Manager->Get<TArray<AFortVolume*>>(ObjectsOffset);
+		Registered = Objects.Num();
+
+		for (int i = 0; i < Objects.Num(); ++i)
+			bContains = bContains || Objects.at(i) == Volume;
+	}
+
+	LOG_INFO(LogCreative, "Volume manager {}: AreIslandsLoading {}, bInSpawningStartup {}, {} volumes registered, the prefab volume is {}registered", Describe(Manager), AreLoading(),
+		StartupOffset == -1 ? -1 : (int)(*(const unsigned char*)((char*)Manager + StartupOffset) & 1), Registered, bContains ? "" : "NOT ");
+
+	// If the manager thinks islands are still loading, the counter is lowered (it is raised by the game when an island starts loading and lowered when it
+	// has finished; that second half may never run here).
+	for (int i = 0; i < 4 && AreLoading(); ++i)
+	{
+		if (auto Fn = Manager->FindFunction("DecrementUserIslandLoading"))
+		{
+			Manager->ProcessEvent(Fn);
+			LOG_INFO(LogCreative, "Volume manager: DecrementUserIslandLoading called, AreIslandsLoading is now {}", AreLoading());
+		}
+		else
+			break;
+	}
+
+	// A volume that never registered is never in its queue.
+	if (!bContains && Volume)
+	{
+		if (auto Fn = Volume->FindFunction("AddSelfToVolumeManager"))
+		{
+			Volume->ProcessEvent(Fn);
+			LOG_INFO(LogCreative, "Volume manager: AddSelfToVolumeManager called on {}", Volume->GetName());
+		}
+	}
+}
+
+// Test (own tick box): the volume manager's own ApplyLevelSaveToWorld for the first few records of the prefab, with actor probes around each.
+static void ApplyPrefabRecords(UFortPlaysetItemDefinition* Playset, AFortVolume* Volume)
+{
+	std::vector<UObject*> Records;
+	PlaysetRecords(Playset, Records, false);
+	LOG_INFO(LogCreative, "Prefab apply test: {} records found for {}", (int)Records.size(), Playset->GetName());
+
+	auto Manager = FirstVolumeManager();
+	auto ApplyFn = Manager ? Manager->FindFunction("ApplyLevelSaveToWorld") : nullptr;
+
+	if (!ApplyFn)
+	{
+		LOG_WARN(LogCreative, "Prefab apply test: the volume manager has no ApplyLevelSaveToWorld");
+		return;
+	}
+
+	for (size_t i = 0; i < Records.size() && i < 3; ++i)
+	{
+		DescribeRecord("Prefab apply test record " + std::to_string(i), Records[i]);
+		CreativeIsland::StartActorProbe("ApplyLevelSaveToWorld record " + std::to_string(i), Volume);
+
+		struct { UObject* SaveToSpawnFrom; bool bComplexShouldSpawn; } Params{ Records[i], true };
+		LOG_INFO(LogCreative, "Prefab apply test: calling ApplyLevelSaveToWorld for record {}", (int)i);
+		Manager->ProcessEvent(ApplyFn, &Params);
+		LOG_INFO(LogCreative, "Prefab apply test: ApplyLevelSaveToWorld for record {} returned", (int)i);
+	}
+}
+
 void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 {
 	// The grenade's OnLoaded callback fires for every asset it loads (sounds, effects, ...), so only a real playset is used. Anything else is ignored.
@@ -889,6 +1150,7 @@ void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 				if (auto SpawnActorsFn = PlaysetDefault->FindFunction("SpawnActorsInPlayset"))
 				{
 					struct { AActor* WorldContextObject; UFortPlaysetItemDefinition* Playset; } Params{ Volume, UsePlayset };
+					CreativeIsland::StartActorProbe("SpawnActorsInPlayset", Volume); // the spawn may be asynchronous, the count right after the call can miss it
 					LOG_INFO(LogCreative, "Thrown prefab: step 0, calling SpawnActorsInPlayset on {} ({} actors in the world)", Name, Before);
 					PlaysetDefault->ProcessEvent(SpawnActorsFn, &Params);
 					const int After = CountActors(L"/Script/Engine.Actor");
@@ -910,6 +1172,27 @@ void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 			++Loaded;
 			continue;
 		}
+
+		// Step 0b: is the volume manager waiting for something? (read-only unless it is stuck "loading")
+		CheckVolumeManager(Volume);
+
+		// Step 0c: what the prefab's props are stored as (read-only), so the layout of the records can be worked out from the log.
+		{
+			static int Described = 0;
+
+			if (Described++ < 4)
+			{
+				std::vector<UObject*> Records;
+				PlaysetRecords(UsePlayset, Records, true);
+
+				for (size_t i = 0; i < Records.size() && i < 2; ++i)
+					DescribeRecord("Prefab data: record " + std::to_string(i), Records[i]);
+			}
+		}
+
+		// Step 0d (own tick box): apply the first records with the volume manager's own function and watch where actors appear.
+		if (Globals::bPrefabApplyRecords)
+			ApplyPrefabRecords(UsePlayset, Volume);
 
 		// Step 1: the game's native SpawnVolume sets the volume's playset directly and skips the SetCurrentPlayset function, which is the one that
 		// would set the volume up for loading. Call that function (clearing the field first, so it does not see "nothing changed").
@@ -1239,6 +1522,19 @@ namespace CreativeMinigame
 		LOG_INFO(LogCreative, "Minigame driver: AdvanceState on {} ({}): {} -> {}", Minigame->GetName(), Why, NameOf(Before), NameOf(StateOf(Minigame)));
 	}
 
+	// The island a player owns is the volume of their portal. CreativePlotLinkedVolume is not used for this: it follows the player into the hub, and the
+	// hub has a minigame of its own that must be left alone.
+	static AFortVolume* IslandVolumeOf(AFortPlayerControllerAthena* Controller)
+	{
+		static auto OwnedPortalOffset = Controller ? Controller->GetOffset("OwnedPortal", false) : -1;
+
+		if (!Controller || OwnedPortalOffset == -1)
+			return nullptr;
+
+		auto Portal = Controller->Get<AFortAthenaCreativePortal*>(OwnedPortalOffset);
+		return Portal ? Portal->GetLinkedVolume() : nullptr;
+	}
+
 	static std::vector<AFortPlayerControllerAthena*> ControllersOn(AFortVolume* Volume)
 	{
 		std::vector<AFortPlayerControllerAthena*> Result;
@@ -1253,7 +1549,7 @@ namespace CreativeMinigame
 		{
 			auto Controller = (AFortPlayerControllerAthena*)Controllers.at(i);
 
-			if (Controller && Controller->GetCreativePlotLinkedVolume() == Volume)
+			if (Controller && IslandVolumeOf(Controller) == Volume)
 				Result.push_back(Controller);
 		}
 
@@ -1322,13 +1618,14 @@ namespace CreativeMinigame
 			}
 
 			const auto Before = Pawn->GetActorLocation();
+			const std::string BeforeText = std::format("{} {} {}", Before.X, Before.Y, Before.Z);
 			struct { UObject* Pawn; } Params{ Pawn };
 			Call(Minigame, "OnPlayerPawnPossessedDuringTransition", &Params);
 			const auto After = Pawn->GetActorLocation();
 			const double dx = (double)After.X - (double)Before.X, dy = (double)After.Y - (double)Before.Y, dz = (double)After.Z - (double)Before.Z;
 			const bool bMoved = dx * dx + dy * dy + dz * dz > 100.0 * 100.0;
 
-			LOG_INFO(LogCreative, "Minigame driver: OnPlayerPawnPossessedDuringTransition for {}: the pawn {} ({} -> {})", Describe(Pawn), bMoved ? "was moved by the game" : "was not moved", Where(Pawn), "now");
+			LOG_INFO(LogCreative, "Minigame driver: OnPlayerPawnPossessedDuringTransition for {}: the pawn {} ({} -> {})", Describe(Pawn), bMoved ? "was moved by the game" : "was not moved", BeforeText, Where(Pawn));
 
 			// If the game left the pawn where it was and the island has a Player Start plate, the pawn goes to the plate.
 			if (!bMoved)
@@ -1624,7 +1921,7 @@ namespace CreativeMinigame
 			for (int i = 0; i < Controllers.Num(); ++i)
 			{
 				auto Controller = (AFortPlayerControllerAthena*)Controllers.at(i);
-				auto Volume = Controller ? Controller->GetCreativePlotLinkedVolume() : nullptr;
+				auto Volume = IslandVolumeOf(Controller);
 				auto Minigame = Volume ? IslandMinigame(Volume) : nullptr;
 
 				if (Minigame)
