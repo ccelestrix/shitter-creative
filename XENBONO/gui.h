@@ -327,6 +327,9 @@ static inline void StaticUI()
 	if (IsCreativeGame() && ImGui::Button("Write the creative state to the log"))
 		CreativeIsland::DumpState("button", 1000);
 
+	if (IsCreativeGame())
+		ImGui::Checkbox("Load thrown prefabs (experimental, the server died after it in tests)", &Globals::bLoadThrownPrefabs);
+
 	if (IsRestartingSupported())
 	{
 		// ImGui::Checkbox("Auto Restart", &Globals::bAutoRestart);

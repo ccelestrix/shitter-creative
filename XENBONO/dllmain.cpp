@@ -903,6 +903,23 @@ bool ReplicateActorHook(UActorChannel* Channel)
 
 // #define CLIENT_ONLY // only console reboot
 
+static BOOL (WINAPI* TerminateProcessOriginal)(HANDLE, UINT) = nullptr;
+static VOID (WINAPI* ExitProcessOriginal)(UINT) = nullptr;
+
+static BOOL WINAPI TerminateProcessHook(HANDLE Process, UINT ExitCode)
+{
+    if (Process == GetCurrentProcess() || GetProcessId(Process) == GetCurrentProcessId())
+        ForceLog::LogExit("TerminateProcess", ExitCode, _ReturnAddress());
+
+    return TerminateProcessOriginal(Process, ExitCode);
+}
+
+static VOID WINAPI ExitProcessHook(UINT ExitCode)
+{
+    ForceLog::LogExit("ExitProcess", ExitCode, _ReturnAddress());
+    ExitProcessOriginal(ExitCode);
+}
+
 DWORD WINAPI Main(LPVOID)
 {
 #ifndef CLIENT_ONLY
@@ -1844,6 +1861,17 @@ DWORD WINAPI Main(LPVOID)
     }
 
     srand(time(0));
+
+    // Anything that ends the process leaves a line in the log.
+    {
+        static auto Kernel32 = GetModuleHandleW(L"kernel32.dll");
+
+        if (auto Terminate = Kernel32 ? GetProcAddress(Kernel32, "TerminateProcess") : nullptr)
+            Hooking::MinHook::Hook((PVOID)Terminate, TerminateProcessHook, (PVOID*)&TerminateProcessOriginal);
+
+        if (auto Exit = Kernel32 ? GetProcAddress(Kernel32, "ExitProcess") : nullptr)
+            Hooking::MinHook::Hook((PVOID)Exit, ExitProcessHook, (PVOID*)&ExitProcessOriginal);
+    }
 
     // Hooked last: MinHook pauses every other thread while it patches, so a hook that takes locks must not be running during the startup hooks above.
     if (IsCreativeGame() && !bProcessEventHooked)

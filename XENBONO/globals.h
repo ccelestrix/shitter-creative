@@ -6,6 +6,8 @@
 
 namespace Globals
 {
+	// Streams thrown prefabs/galleries into the volume the grenade spawns. Experimental: in testing the server died a few seconds after it, so it is off.
+	extern inline bool bLoadThrownPrefabs = false;
 	extern inline bool bCreative = false; // the Creative tick box: opens the creative hub map. Off by default, 12.41 runs the creative playlist on the normal map.
 	extern inline bool bGoingToPlayEvent = false;
 	extern inline bool bEnableAGIDs = true;

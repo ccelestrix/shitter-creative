@@ -187,6 +187,21 @@ namespace ForceLog
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    // Called when the game (or something in it) ends the process, so a death with no exception still leaves a line. Says which module called
+    // it and where, so it can be looked up.
+    inline void LogExit(const char* What, UINT code, void* returnAddress)
+    {
+        HMODULE module = nullptr;
+        char path[MAX_PATH] = {};
+
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)returnAddress, &module) && module)
+            GetModuleFileNameA(module, path, MAX_PATH);
+
+        char text[512];
+        sprintf_s(text, "%s(%u) called from %s + 0x%llX (thread %lu)", What, code, path[0] ? path : "an unknown module", (unsigned long long)returnAddress - (unsigned long long)module, GetCurrentThreadId());
+        Write("critical", "LogCrash", text);
+    }
+
     inline void InstallCrashLogging()
     {
         AddVectoredExceptionHandler(1, CrashHandler);
