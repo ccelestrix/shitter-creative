@@ -2604,7 +2604,160 @@ static UClass* FindDeviceClass(const std::string& Device)
 	return nullptr;
 }
 
-// Returns 1 when a device was spawned.
+// ---------------------------------------------------------------------------------------------------------------------
+// Devices from their map. Every device has a map CP_Devices_<Name> (the registry lists them) that holds what the real game puts in the volume. The map
+// is loaded as an asset only (not streamed into the world), its actors are read (class and placement) and the same actors are spawned in the volume.
+// ---------------------------------------------------------------------------------------------------------------------
+static UObject* SafeLoadAsset(UClass* Class, const wchar_t* Path)
+{
+	__try
+	{
+		return StaticLoadObjectOriginal ? (UObject*)StaticLoadObjectOriginal(Class, nullptr, Path, nullptr, 0, nullptr, false) : nullptr;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return nullptr;
+	}
+}
+
+struct MapActor
+{
+	UClass* Class = nullptr;
+	double X = 0, Y = 0, Z = 0;
+	float Pitch = 0, Yaw = 0, Roll = 0;
+	double ScaleX = 1, ScaleY = 1, ScaleZ = 1;
+};
+
+static std::string LowerText(std::string Text)
+{
+	std::transform(Text.begin(), Text.end(), Text.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+	return Text;
+}
+
+static std::vector<MapActor> ReadDeviceMap(const std::string& Device)
+{
+	static std::map<std::string, std::vector<MapActor>> Cache;
+
+	if (auto It = Cache.find(Device); It != Cache.end())
+		return It->second;
+
+	std::vector<MapActor>& Result = Cache[Device];
+	static auto WorldClass = FindObject<UClass>(L"/Script/Engine.World");
+
+	// the map: CP_Devices_<Name> in the devices map folder
+	std::string Package;
+
+	for (auto& [Name, Class] : RegistryAssets("/Game/Creative/Maps/Devices", false))
+	{
+		if (Class != "World")
+			continue;
+
+		const auto Short = LowerText(Name.substr(Name.find_last_of('/') + 1));
+
+		if (Short == "cp_devices_" + LowerText(Device))
+		{
+			Package = Name;
+			break;
+		}
+
+		if (Package.empty() && Short.find(LowerText(Device)) != std::string::npos)
+			Package = Name;
+	}
+
+	if (Package.empty())
+	{
+		LOG_WARN(LogCreative, "Device map {}: the registry lists no map for it under /Game/Creative/Maps/Devices", Device);
+		return Result;
+	}
+
+	const std::string PathText = Package + "." + Package.substr(Package.find_last_of('/') + 1);
+	const std::wstring Path(PathText.begin(), PathText.end());
+	UObject* World = FindObject<UObject>(Path.c_str());
+
+	if (!World)
+		World = SafeLoadAsset(WorldClass, Path.c_str());
+
+	LOG_INFO(LogCreative, "Device map {}: {} {}", Device, PathText, World ? "loaded" : "COULD NOT BE LOADED");
+
+	if (!World)
+		return Result;
+
+	const int LevelOffset = World->GetOffset("PersistentLevel", false);
+	UObject* Level = LevelOffset == -1 ? nullptr : World->Get<UObject*>(LevelOffset);
+
+	if (!PropDump::IsLiveObject(Level))
+	{
+		LOG_WARN(LogCreative, "Device map {}: the map has no persistent level", Device);
+		return Result;
+	}
+
+	// ULevel::Actors, at 0x98 in this build's dump (not a reflected property)
+	constexpr int ActorsAt = 0x98;
+
+	if (!Readable((char*)Level + ActorsAt, 16))
+		return Result;
+
+	AActor** Actors = *(AActor***)((char*)Level + ActorsAt);
+	const int Num = *(int*)((char*)Level + ActorsAt + 8);
+
+	LOG_INFO(LogCreative, "Device map {}: the level holds {} actors", Device, Num);
+
+	if (!Actors || Num <= 0 || Num > 5000 || !Readable(Actors, (size_t)Num * 8))
+		return Result;
+
+	for (int i = 0; i < Num; ++i)
+	{
+		auto Actor = Actors[i];
+
+		if (!PropDump::IsLiveObject(Actor) || !PropDump::IsLiveObject(Actor->ClassPrivate))
+			continue;
+
+		const std::string ClassText = Actor->ClassPrivate->GetFullName();
+		const bool bGameClass = ClassText.find(" /Game/") != std::string::npos;
+
+		const int RootOffset = Actor->GetOffset("RootComponent", false);
+		UObject* Root = RootOffset == -1 ? nullptr : Actor->Get<UObject*>(RootOffset);
+
+		MapActor Entry;
+		Entry.Class = Actor->ClassPrivate;
+
+		if (PropDump::IsLiveObject(Root))
+		{
+			const int LocationOffset = Root->GetOffset("RelativeLocation", false);
+			const int RotationOffset = Root->GetOffset("RelativeRotation", false);
+			const int ScaleOffset = Root->GetOffset("RelativeScale3D", false);
+
+			if (LocationOffset != -1 && Readable((char*)Root + LocationOffset, 12))
+			{
+				const float* L = (const float*)((char*)Root + LocationOffset);
+				Entry.X = L[0]; Entry.Y = L[1]; Entry.Z = L[2];
+			}
+
+			if (RotationOffset != -1 && Readable((char*)Root + RotationOffset, 12))
+			{
+				const float* R = (const float*)((char*)Root + RotationOffset);
+				Entry.Pitch = R[0]; Entry.Yaw = R[1]; Entry.Roll = R[2];
+			}
+
+			if (ScaleOffset != -1 && Readable((char*)Root + ScaleOffset, 12))
+			{
+				const float* S = (const float*)((char*)Root + ScaleOffset);
+				Entry.ScaleX = S[0]; Entry.ScaleY = S[1]; Entry.ScaleZ = S[2];
+			}
+		}
+
+		LOG_INFO(LogCreative, "  map actor {}: {} at {:.0f} {:.0f} {:.0f}, rotation {:.0f} {:.0f} {:.0f}, scale {:.2f} {:.2f} {:.2f}{}", i, ClassText, Entry.X, Entry.Y, Entry.Z, Entry.Pitch, Entry.Yaw, Entry.Roll, Entry.ScaleX,
+			Entry.ScaleY, Entry.ScaleZ, bGameClass ? "" : " (an engine class, not spawned)");
+
+		// only the game's own blueprints are devices; the engine's actors (world settings, lights, brushes) are not
+		if (bGameClass)
+			Result.push_back(Entry);
+	}
+
+	return Result;
+}
+
+// Returns how many actors were spawned for the device (0 when none could be).
 static int BuildOwnDevice(AFortVolume* Volume, UObject* Playset)
 {
 	const std::string Name = Playset->GetName();
@@ -2614,12 +2767,19 @@ static int BuildOwnDevice(AFortVolume* Volume, UObject* Playset)
 		return 0;
 
 	const std::string Device = Name.substr(Prefix.size());
-	auto Class = FindDeviceClass(Device);
+	auto MapActors = ReadDeviceMap(Device);
 
-	if (!Class)
+	UClass* Class = nullptr;
+
+	if (MapActors.empty())
 	{
-		LOG_WARN(LogCreative, "Own device {}: no actor class was found", Device);
-		return 0;
+		Class = FindDeviceClass(Device);
+
+		if (!Class)
+		{
+			LOG_WARN(LogCreative, "Own device {}: neither the map nor the device folder gave an actor class", Device);
+			return 0;
+		}
 	}
 
 	// the thrower, for the team and the build animation
@@ -2649,26 +2809,62 @@ static int BuildOwnDevice(AFortVolume* Volume, UObject* Playset)
 		if (auto State = Cast<AFortPlayerStateAthena, false>(Builder->GetPlayerState()))
 			Team = State->GetTeamIndex();
 
-	FTransform Transform{};
-	Transform.Translation = Volume->GetActorLocation();
-	Transform.Scale3D = { 1, 1, 1 };
-
-	auto Device_ = GetWorld()->SpawnActor<ABuildingActor>(Class, Transform);
-
-	if (!Device_)
+	// the playset's own offset for its content (the devices sit 75 above the middle of their grid cell)
+	double OffsetZ = 0;
 	{
-		LOG_WARN(LogCreative, "Own device {}: spawning {} failed", Device, Class->GetName());
-		return 0;
+		const int UseOffset = Playset->GetOffset("bUseLocationOffset", false);
+		const int LocationOffset = Playset->GetOffset("LocationOffset", false);
+
+		if (UseOffset != -1 && LocationOffset != -1 && Playset->Get<bool>(UseOffset) && Readable((char*)Playset + LocationOffset, 12))
+			OffsetZ = ((const float*)((char*)Playset + LocationOffset))[2];
 	}
 
-	if (Builder)
-		Device_->InitializeBuildingActor(Builder, Device_, true);
+	static auto BuildingActorClass = FindObject<UClass>(L"/Script/FortniteGame.BuildingActor");
+	const auto Base = Volume->GetActorLocation();
+	int Spawned = 0;
 
-	if (Team >= 0)
-		Device_->SetTeam((unsigned char)Team);
+	if (MapActors.empty())
+	{
+		MapActor Single;
+		Single.Class = Class;
+		MapActors.push_back(Single);
+	}
 
-	LOG_INFO(LogCreative, "Own device {}: spawned {} ({}) at {}, builder {}, team {}", Device, Class->GetName(), Describe(Device_), Where(Device_), Describe(Builder), Team);
-	return 1;
+	for (auto& Entry : MapActors)
+	{
+		FRotator Rotation{};
+		Rotation.Pitch = Entry.Pitch; Rotation.Yaw = Entry.Yaw; Rotation.Roll = Entry.Roll;
+
+		FTransform Transform{};
+		Transform.Translation = FVector((float)((double)Base.X + Entry.X), (float)((double)Base.Y + Entry.Y), (float)((double)Base.Z + OffsetZ + Entry.Z));
+		Transform.Rotation = Rotation.Quaternion();
+		Transform.Scale3D = FVector((float)Entry.ScaleX, (float)Entry.ScaleY, (float)Entry.ScaleZ);
+
+		auto Spawned_ = GetWorld()->SpawnActor<AActor>(Entry.Class, Transform);
+
+		if (!Spawned_)
+		{
+			LOG_WARN(LogCreative, "Own device {}: spawning {} failed", Device, Entry.Class->GetName());
+			continue;
+		}
+
+		++Spawned;
+
+		// a building actor is told who built it (team, build animation)
+		if (BuildingActorClass && InheritsFrom(Entry.Class, BuildingActorClass))
+		{
+			if (Builder)
+				((ABuildingActor*)Spawned_)->InitializeBuildingActor(Builder, (ABuildingActor*)Spawned_, true);
+
+			if (Team >= 0)
+				((ABuildingActor*)Spawned_)->SetTeam((unsigned char)Team);
+		}
+
+		LOG_INFO(LogCreative, "Own device {}: spawned {} ({}) at {}", Device, Entry.Class->GetName(), Describe(Spawned_), Where(Spawned_));
+	}
+
+	LOG_INFO(LogCreative, "Own device {}: {} actors spawned (builder {}, team {})", Device, Spawned, Describe(Builder), Team);
+	return Spawned;
 }
 
 void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
