@@ -1919,41 +1919,119 @@ static std::vector<ClassCount> ReadClassCounts(UObject* Playset)
 	return Result;
 }
 
-enum class PieceKind { Floor, Roof, Stairs, Door, Window, Opening, Wall, Prop };
+enum class PieceKind { Floor, Roof, Stairs, Door, Window, Opening, Wall, Pillar, Trim, WallDecor, Prop };
 
 static const char* KindName(PieceKind Kind)
 {
-	static const char* Names[] = { "floor", "roof", "stairs", "door", "window", "opening", "wall", "decoration" };
+	static const char* Names[] = { "floor", "roof", "stairs", "door", "window", "opening", "wall", "pillar", "trim", "wall decoration", "decoration" };
 	return Names[(int)Kind];
 }
 
 static PieceKind KindOf(const std::string& Path)
 {
 	const auto Name = Path.substr(Path.find_last_of('/') + 1);
+	auto Has = [&](const char* Word) { return ContainsNoCase(Name, Word); };
 
-	if (ContainsNoCase(Name, "stair") || ContainsNoCase(Name, "ramp"))
+	if (Has("stair") || Has("ramp"))
 		return PieceKind::Stairs;
 
-	if (ContainsNoCase(Name, "roof") || ContainsNoCase(Name, "ceiling"))
+	if (Has("roof") || Has("ceiling"))
 		return PieceKind::Roof;
 
-	if (ContainsNoCase(Name, "floor") || ContainsNoCase(Name, "ground") || ContainsNoCase(Name, "slab") || ContainsNoCase(Name, "deck"))
+	if (Has("floor") || Has("ground") || Has("slab") || Has("deck"))
 		return PieceKind::Floor;
 
-	if (ContainsNoCase(Name, "window"))
+	if (Has("window"))
 		return PieceKind::Window;
 
-	if (ContainsNoCase(Name, "doorway") || ContainsNoCase(Name, "arch") || ContainsNoCase(Name, "opening") || ContainsNoCase(Name, "gate"))
+	if (Has("doorway") || Has("arch") || Has("opening") || Has("gate"))
 		return PieceKind::Opening;
 
-	if (ContainsNoCase(Name, "door"))
+	if (Has("door"))
 		return PieceKind::Door;
 
-	if (ContainsNoCase(Name, "wall") || ContainsNoCase(Name, "corner") || ContainsNoCase(Name, "pillar") || ContainsNoCase(Name, "column") || ContainsNoCase(Name, "balcony") || ContainsNoCase(Name, "rail") ||
-		ContainsNoCase(Name, "fence") || ContainsNoCase(Name, "cap"))
+	if (Has("pillar") || Has("column") || Has("post") || Has("pole"))
+		return PieceKind::Pillar;
+
+	if (Has("wall_light") || Has("wallart") || Has("wall_art") || Has("painting") || Has("poster") || Has("sign") || Has("banner"))
+		return PieceKind::WallDecor;
+
+	if (Has("cap") || Has("battlement") || Has("rail") || Has("trim") || Has("balcony") || Has("fence") || Has("parapet") || Has("beam") || Has("gutter"))
+		return PieceKind::Trim;
+
+	if (Has("wall"))
 		return PieceKind::Wall;
 
 	return PieceKind::Prop;
+}
+
+// What a piece measures. The pivot of a piece is not known, but its bounding box is, so every piece is placed by the middle of its box.
+struct PieceInfo
+{
+	UClass* Class = nullptr;
+	int Count = 0;
+	PieceKind Kind = PieceKind::Prop;
+	double OffsetX = 0, OffsetY = 0, OffsetZ = 0; // the middle of the box minus the actor's location (at yaw 0)
+	double ExtentX = 256, ExtentY = 32, ExtentZ = 192; // half sizes at yaw 0
+	bool bMeasured = false;
+
+	double LongSide() const { return 2.0 * (std::max)(ExtentX, ExtentY); }
+	bool LongAlongX() const { return ExtentX >= ExtentY; }
+};
+
+static bool ActorBoundsOf(AActor* Actor, double& OriginX, double& OriginY, double& OriginZ, double& ExtentX, double& ExtentY, double& ExtentZ)
+{
+	static auto Fn = FindObject<UFunction>(L"/Script/Engine.Actor.GetActorBounds");
+
+	if (!Fn)
+		return false;
+
+	struct { bool bOnlyCollidingComponents; char Pad0[3]; float Origin[3]; float BoxExtent[3]; bool bIncludeFromChildActors; char Pad1[3]; } Params{};
+	Actor->ProcessEvent(Fn, &Params);
+
+	OriginX = Params.Origin[0]; OriginY = Params.Origin[1]; OriginZ = Params.Origin[2];
+	ExtentX = Params.BoxExtent[0]; ExtentY = Params.BoxExtent[1]; ExtentZ = Params.BoxExtent[2];
+	return ExtentX > 1 || ExtentY > 1 || ExtentZ > 1;
+}
+
+// Spawns the piece high above the prefab, reads its box, removes it again.
+static void MeasurePiece(PieceInfo& Info, const FVector& Probe)
+{
+	FTransform Transform{};
+	Transform.Translation = Probe;
+	Transform.Scale3D = { 1, 1, 1 };
+
+	auto Actor = GetWorld()->SpawnActor<AActor>(Info.Class, Transform);
+
+	if (!Actor)
+		return;
+
+	double OX, OY, OZ, EX, EY, EZ;
+
+	if (ActorBoundsOf(Actor, OX, OY, OZ, EX, EY, EZ))
+	{
+		Info.OffsetX = OX - (double)Probe.X;
+		Info.OffsetY = OY - (double)Probe.Y;
+		Info.OffsetZ = OZ - (double)Probe.Z;
+		Info.ExtentX = EX; Info.ExtentY = EY; Info.ExtentZ = EZ;
+		Info.bMeasured = true;
+	}
+
+	static auto DestroyFn = FindObject<UFunction>(L"/Script/Engine.Actor.K2_DestroyActor");
+
+	if (DestroyFn)
+		Actor->ProcessEvent(DestroyFn);
+}
+
+// Places a piece so that the middle of its box is at (CX, CY) horizontally and its underside is at BottomZ.
+static ABuildingSMActor* PlaceBox(const PieceInfo& Info, double CX, double CY, double BottomZ, float Yaw, AFortPlayerControllerAthena* Builder, int Team)
+{
+	const double Radians = (double)Yaw * 3.14159265358979 / 180.0;
+	const double Cos = std::cos(Radians), Sin = std::sin(Radians);
+	const double RotatedX = Info.OffsetX * Cos - Info.OffsetY * Sin;
+	const double RotatedY = Info.OffsetX * Sin + Info.OffsetY * Cos;
+
+	return SpawnPiece(Info.Class, CX - RotatedX, CY - RotatedY, BottomZ + Info.ExtentZ - Info.OffsetZ, Yaw, Builder, Team);
 }
 
 // Returns how many pieces were built; 0 when the playset lists no pieces (the wood house is used then).
@@ -1980,14 +2058,13 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 	if (Props <= 0 && SizeX * SizeY <= 1)
 		return 0;
 
-	SizeX = (std::max)(2, (std::min)(SizeX, 12));
-	SizeY = (std::max)(2, (std::min)(SizeY, 12));
+	SizeX = (std::max)(2, (std::min)(SizeX, 14));
+	SizeY = (std::max)(2, (std::min)(SizeY, 14));
 
 	// the most used pieces first, at most 24 different classes (each is loaded when first needed)
 	std::stable_sort(Counts.begin(), Counts.end(), [](const ClassCount& A, const ClassCount& B) { return A.Count > B.Count; });
 
-	struct Loaded { UClass* Class; int Count; PieceKind Kind; };
-	std::vector<Loaded> Pieces;
+	std::vector<PieceInfo> Pieces;
 	int Failed = 0;
 
 	for (auto& Entry : Counts)
@@ -2008,7 +2085,11 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 			continue;
 		}
 
-		Pieces.push_back({ Class, Entry.Count, KindOf(Entry.Path) });
+		PieceInfo Info;
+		Info.Class = Class;
+		Info.Count = Entry.Count;
+		Info.Kind = KindOf(Entry.Path);
+		Pieces.push_back(Info);
 	}
 
 	if (Pieces.empty())
@@ -2016,6 +2097,13 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 		LOG_WARN(LogCreative, "Own prefab (real pieces): none of the {} classes of {} could be loaded", (int)Counts.size(), Playset->GetName());
 		return 0;
 	}
+
+	const auto Center = Volume->GetActorLocation();
+	const FVector Probe((float)Center.X, (float)Center.Y, (float)Center.Z + 12000.f);
+
+	for (auto& Piece : Pieces)
+		if (Piece.Kind != PieceKind::WallDecor)
+			MeasurePiece(Piece, Probe);
 
 	// the thrower builds the pieces (their team, the build animation)
 	static auto ControllerClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerControllerAthena");
@@ -2044,83 +2132,108 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 		if (auto State = Cast<AFortPlayerStateAthena, false>(Builder->GetPlayerState()))
 			Team = State->GetTeamIndex();
 
-	const auto Center = Volume->GetActorLocation();
-	const double OriginX = std::floor(((double)Center.X - SizeX * 256.0) / 256.0 + 0.5) * 256.0;
-	const double OriginY = std::floor(((double)Center.Y - SizeY * 256.0) / 256.0 + 0.5) * 256.0;
+	// The size of the building follows the wall panels: their length is the pitch along the edge, their height one level.
+	PieceInfo* Panel = nullptr;
+
+	for (auto& P : Pieces)
+		if ((P.Kind == PieceKind::Wall || P.Kind == PieceKind::Window || P.Kind == PieceKind::Opening) && P.bMeasured && (!Panel || P.Count > Panel->Count))
+			Panel = &P;
+
+	const double Pitch = Panel ? (std::max)(256.0, (std::min)(Panel->LongSide(), 1024.0)) : 512.0;
+	const double LevelHeight = Panel ? (std::max)(192.0, (std::min)(2.0 * Panel->ExtentZ, 1024.0)) : 384.0;
+
+	const int SlotsX = (std::max)(2, (std::min)((int)std::lround(SizeX * 512.0 / Pitch), 14));
+	const int SlotsY = (std::max)(2, (std::min)((int)std::lround(SizeY * 512.0 / Pitch), 14));
+	const double Width = SlotsX * Pitch, Depth = SlotsY * Pitch;
+	const double MinX = (double)Center.X - Width / 2.0, MinY = (double)Center.Y - Depth / 2.0;
 	const double GroundZ = (double)Center.Z;
-	const double WallHeight = 384.0;
 
-	auto Total = [&](PieceKind Kind) { int N = 0; for (auto& P : Pieces) if (P.Kind == Kind) N += P.Count; return N; };
+	auto Total = [&](std::initializer_list<PieceKind> Kinds) {
+		int N = 0;
 
-	// the wall pieces: how many levels they fill round the edge
-	const int PerLevel = 2 * (SizeX + SizeY);
-	const int WallPieces = Total(PieceKind::Wall) + Total(PieceKind::Window) + Total(PieceKind::Opening) + Total(PieceKind::Door);
-	const int Levels = (std::max)(1, (std::min)((WallPieces + PerLevel - 1) / PerLevel, 3));
+		for (auto& P : Pieces)
+			for (auto K : Kinds)
+				if (P.Kind == K)
+					N += P.Count;
 
-	// slot k of a level: the south edge west to east, the east edge south to north, the north edge east to west, the west edge north to south
-	auto SlotAt = [&](int k, int Level, double& X, double& Y, float& Yaw) {
-		X = Y = 0;
-		Yaw = 0;
-		const double Z = Level * WallHeight; (void)Z;
-
-		if (k < SizeX) { X = OriginX + k * 512.0; Y = OriginY; Yaw = 270.f; return; }
-		k -= SizeX;
-		if (k < SizeY) { X = OriginX + SizeX * 512.0; Y = OriginY + k * 512.0; Yaw = 0.f; return; }
-		k -= SizeY;
-		if (k < SizeX) { X = OriginX + (SizeX - 1 - k) * 512.0; Y = OriginY + SizeY * 512.0; Yaw = 270.f; return; }
-		k -= SizeX;
-		X = OriginX; Y = OriginY + (SizeY - 1 - k) * 512.0; Yaw = 0.f;
+		return N;
 	};
+
+	const int PerLevel = 2 * (SlotsX + SlotsY);
+	const int PanelCount = Total({ PieceKind::Wall, PieceKind::Window, PieceKind::Opening, PieceKind::Door });
+	const int Levels = (std::max)(1, (std::min)((PanelCount + PerLevel - 1) / PerLevel, 3));
 
 	int Built = 0;
 	std::map<PieceKind, int> ByKind;
 
-	auto Spawn = [&](const Loaded& P, double X, double Y, double Z, float Yaw) {
-		if (SpawnPiece(P.Class, X, Y, Z, Yaw, Builder, Team))
+	auto Put = [&](const PieceInfo& P, double CX, double CY, double BottomZ, float Yaw) {
+		if (PlaceBox(P, CX, CY, BottomZ, Yaw, Builder, Team))
 		{
 			++Built;
 			++ByKind[P.Kind];
 		}
 	};
 
-	// -- walls: the door in front, then the rest spread evenly by how many of each there are
-	std::vector<Loaded*> Wallish;
+	// slot k of a level, going round: the south edge west to east, the east edge south to north, the north edge east to west, the west edge north to south.
+	// Gives the middle of the slot and whether the edge runs along X.
+	auto SlotAt = [&](int k, double& X, double& Y, bool& bAlongX) {
+		if (k < SlotsX) { X = MinX + (k + 0.5) * Pitch; Y = MinY; bAlongX = true; return; }
+		k -= SlotsX;
+		if (k < SlotsY) { X = MinX + Width; Y = MinY + (k + 0.5) * Pitch; bAlongX = false; return; }
+		k -= SlotsY;
+		if (k < SlotsX) { X = MinX + Width - (k + 0.5) * Pitch; Y = MinY + Depth; bAlongX = true; return; }
+		k -= SlotsX;
+		X = MinX; Y = MinY + Depth - (k + 0.5) * Pitch; bAlongX = false;
+	};
+
+	// a panel's long side has to run along its edge
+	auto YawFor = [&](const PieceInfo& P, bool bEdgeAlongX) -> float { return (P.LongAlongX() == bEdgeAlongX) ? 0.f : 90.f; };
+
+	// -- the wall panels: the door in front, then the rest spread by how many of each there are
+	std::vector<PieceInfo*> Panels;
 	std::vector<int> Remaining;
 
 	for (auto& P : Pieces)
 		if (P.Kind == PieceKind::Wall || P.Kind == PieceKind::Window || P.Kind == PieceKind::Opening || P.Kind == PieceKind::Door)
 		{
-			Wallish.push_back(&P);
+			Panels.push_back(&P);
 			Remaining.push_back(P.Count);
 		}
 
-	auto TakeNext = [&](bool bDoorOnly) -> Loaded* {
+	auto TakeNext = [&](bool bDoorOnly) -> PieceInfo* {
 		int Best = -1;
 		double BestShare = -1;
 
-		for (size_t i = 0; i < Wallish.size(); ++i)
+		for (size_t i = 0; i < Panels.size(); ++i)
 		{
-			if (Remaining[i] <= 0 || (bDoorOnly && Wallish[i]->Kind != PieceKind::Door) || (!bDoorOnly && Wallish[i]->Kind == PieceKind::Door))
+			const bool bDoor = Panels[i]->Kind == PieceKind::Door;
+
+			if (Remaining[i] <= 0 || bDoorOnly != bDoor)
 				continue;
 
-			const double Share = (double)Remaining[i] / Wallish[i]->Count + Wallish[i]->Count * 0.0001; // the class with most left, in proportion to its total
-			if (Share > BestShare) { BestShare = Share; Best = (int)i; }
+			const double Share = (double)Remaining[i] / Panels[i]->Count + Panels[i]->Count * 0.0001;
+
+			if (Share > BestShare)
+			{
+				BestShare = Share;
+				Best = (int)i;
+			}
 		}
 
 		if (Best < 0)
 			return nullptr;
 
 		--Remaining[Best];
-		return Wallish[Best];
+		return Panels[Best];
 	};
 
 	for (int Level = 0; Level < Levels; ++Level)
 	{
 		for (int k = 0; k < PerLevel; ++k)
 		{
-			Loaded* Piece = nullptr;
+			PieceInfo* Piece = nullptr;
 
-			if (Level == 0 && k == SizeX / 2)
+			if (Level == 0 && k == SlotsX / 2)
 				Piece = TakeNext(true); // the door, front centre
 
 			if (!Piece)
@@ -2130,9 +2243,25 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 				break;
 
 			double X, Y;
-			float Yaw;
-			SlotAt(k, Level, X, Y, Yaw);
-			Spawn(*Piece, X, Y, GroundZ + Level * WallHeight, Yaw);
+			bool bAlongX;
+			SlotAt(k, X, Y, bAlongX);
+			Put(*Piece, X, Y, GroundZ + Level * LevelHeight, YawFor(*Piece, bAlongX));
+		}
+	}
+
+	// -- pillars at the corners and the middle of each edge, one per level
+	{
+		std::vector<std::pair<double, double>> Spots = { { MinX, MinY }, { MinX + Width, MinY }, { MinX + Width, MinY + Depth }, { MinX, MinY + Depth },
+			{ MinX + Width / 2, MinY }, { MinX + Width, MinY + Depth / 2 }, { MinX + Width / 2, MinY + Depth }, { MinX, MinY + Depth / 2 } };
+		int Placed = 0;
+
+		for (auto& P : Pieces)
+		{
+			if (P.Kind != PieceKind::Pillar)
+				continue;
+
+			for (int n = 0; n < P.Count && Placed < (int)Spots.size() * Levels; ++n, ++Placed)
+				Put(P, Spots[Placed % Spots.size()].first, Spots[Placed % Spots.size()].second, GroundZ + (Placed / (int)Spots.size()) * LevelHeight, 0.f);
 		}
 	}
 
@@ -2145,20 +2274,23 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 			if (P.Kind != PieceKind::Floor)
 				continue;
 
+			const double Cell = (std::max)(128.0, (std::min)(P.LongSide(), 2048.0));
+			const int CellsX = (std::max)(1, (int)std::lround(Width / Cell)), CellsY = (std::max)(1, (int)std::lround(Depth / Cell));
+
 			for (int n = 0; n < P.Count; ++n, ++Tile)
 			{
-				const int Deck = Tile / (SizeX * SizeY);
-				const int At = Tile % (SizeX * SizeY);
+				const int Deck = Tile / (CellsX * CellsY);
+				const int At = Tile % (CellsX * CellsY);
 
 				if (Deck > 1)
 					break;
 
-				Spawn(P, OriginX + (At % SizeX) * 512.0, OriginY + (At / SizeX) * 512.0, GroundZ + Deck * Levels * WallHeight, 0.f);
+				Put(P, MinX + (At % CellsX + 0.5) * Cell, MinY + (At / CellsX + 0.5) * Cell, GroundZ + Deck * Levels * LevelHeight, 0.f);
 			}
 		}
 	}
 
-	// -- roof: over the walls
+	// -- the roof, over the walls
 	{
 		int Tile = 0;
 
@@ -2167,12 +2299,34 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 			if (P.Kind != PieceKind::Roof)
 				continue;
 
-			for (int n = 0; n < P.Count && Tile < SizeX * SizeY; ++n, ++Tile)
-				Spawn(P, OriginX + (Tile % SizeX) * 512.0, OriginY + (Tile / SizeX) * 512.0, GroundZ + Levels * WallHeight, 0.f);
+			const double Cell = (std::max)(128.0, (std::min)(P.LongSide(), 2048.0));
+			const int CellsX = (std::max)(1, (int)std::lround(Width / Cell)), CellsY = (std::max)(1, (int)std::lround(Depth / Cell));
+
+			for (int n = 0; n < P.Count && Tile < CellsX * CellsY; ++n, ++Tile)
+				Put(P, MinX + (Tile % CellsX + 0.5) * Cell, MinY + (Tile / CellsX + 0.5) * Cell, GroundZ + Levels * LevelHeight, 0.f);
 		}
 	}
 
-	// -- stairs inside, a step apart
+	// -- trim (battlements, rails, caps) along the top edge
+	{
+		int Slot = 0;
+
+		for (auto& P : Pieces)
+		{
+			if (P.Kind != PieceKind::Trim)
+				continue;
+
+			for (int n = 0; n < P.Count && Slot < PerLevel; ++n, ++Slot)
+			{
+				double X, Y;
+				bool bAlongX;
+				SlotAt(Slot, X, Y, bAlongX);
+				Put(P, X, Y, GroundZ + Levels * LevelHeight, YawFor(P, bAlongX));
+			}
+		}
+	}
+
+	// -- stairs inside, near the south west corner
 	{
 		int Placed = 0;
 
@@ -2181,13 +2335,14 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 			if (P.Kind != PieceKind::Stairs)
 				continue;
 
-			for (int n = 0; n < P.Count && Placed < 3; ++n, ++Placed)
-				Spawn(P, OriginX + 512.0 * (1 + Placed % (std::max)(1, SizeX - 2)), OriginY + 512.0, GroundZ, 0.f);
+			for (int n = 0; n < P.Count && Placed < 2; ++n, ++Placed)
+				Put(P, MinX + Pitch * (1.5 + Placed * 1.5), MinY + Pitch * 1.5, GroundZ, 0.f);
 		}
 	}
 
-	// -- decoration on the ground, tile by tile through the inside
+	// -- decoration on the ground in rows through the inside, spaced by its own size
 	{
+		double X = MinX + Pitch * 1.2, Y = MinY + Pitch * 1.2, RowHeight = 0;
 		int Placed = 0;
 
 		for (auto& P : Pieces)
@@ -2195,10 +2350,23 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 			if (P.Kind != PieceKind::Prop)
 				continue;
 
+			const double Size = (std::max)(96.0, P.LongSide()) + 48.0;
+
 			for (int n = 0; n < P.Count && Placed < 40; ++n, ++Placed)
 			{
-				const int Tile = Placed % (SizeX * SizeY);
-				Spawn(P, OriginX + (Tile % SizeX) * 512.0 + 256.0, OriginY + (Tile / SizeX) * 512.0 + 256.0, GroundZ, (float)((Placed % 4) * 90));
+				if (X + Size > MinX + Width - Pitch)
+				{
+					X = MinX + Pitch * 1.2;
+					Y += RowHeight;
+					RowHeight = 0;
+				}
+
+				if (Y + Size > MinY + Depth - Pitch)
+					break;
+
+				Put(P, X + Size / 2, Y + Size / 2, GroundZ, (float)((Placed % 4) * 90));
+				X += Size;
+				RowHeight = (std::max)(RowHeight, Size);
 			}
 		}
 	}
@@ -2208,10 +2376,11 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 	for (auto& Entry : ByKind)
 		Summary += std::format(" {}x{}", Entry.second, KindName(Entry.first));
 
-	LOG_INFO(LogCreative, "Own prefab (real pieces): built {} pieces for {} ({} x {} tiles, {} levels, {} classes loaded, {} could not be loaded):{}", Built, Playset->GetName(), SizeX, SizeY, Levels, (int)Pieces.size(), Failed, Summary);
+	LOG_INFO(LogCreative, "Own prefab (real pieces): built {} pieces for {} ({} x {} slots of {:.0f}, level height {:.0f}, {} levels, {} classes loaded, {} could not be loaded):{}", Built, Playset->GetName(), SlotsX, SlotsY, Pitch,
+		LevelHeight, Levels, (int)Pieces.size(), Failed, Summary);
 
 	for (auto& P : Pieces)
-		LOG_INFO(LogCreative, "  piece {} x{} as {}", P.Class->GetName(), P.Count, KindName(P.Kind));
+		LOG_INFO(LogCreative, "  piece {} x{} as {}: box {:.0f} x {:.0f} x {:.0f}{}", P.Class->GetName(), P.Count, KindName(P.Kind), 2 * P.ExtentX, 2 * P.ExtentY, 2 * P.ExtentZ, P.bMeasured ? "" : " (not measured)");
 
 	return Built;
 }
