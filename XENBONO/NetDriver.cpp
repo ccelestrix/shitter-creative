@@ -593,6 +593,39 @@ TSet<FName>* GetClientVisibleLevelNames(UNetConnection* NetConnection)
 	return (TSet<FName>*)(__int64(NetConnection) + 0x336C8);
 }
 
+// For diagnostics: how many client connections have an actor channel for the actor (-1: no net driver), and whether the actor's level is
+// initialised for the first connection (-1: unknown).
+int ActorChannelCount(AActor* Actor, int* OutLevelInitialized)
+{
+	if (OutLevelInitialized)
+		*OutLevelInitialized = -1;
+
+	auto World = GetWorld();
+	auto NetDriver = World ? World->GetNetDriver() : nullptr;
+
+	if (!NetDriver || !Actor)
+		return -1;
+
+	auto& Connections = NetDriver->GetClientConnections();
+	int Count = 0;
+
+	for (int i = 0; i < Connections.Num(); ++i)
+	{
+		auto Connection = Connections.at(i);
+
+		if (!Connection)
+			continue;
+
+		if (FindChannel(Actor, Connection))
+			++Count;
+
+		if (OutLevelInitialized && i == 0)
+			*OutLevelInitialized = NetDriver->IsLevelInitializedForActor(Actor, Connection) ? 1 : 0;
+	}
+
+	return Count;
+}
+
 int32 UNetDriver::ServerReplicateActors()
 {
 	int32 Updated = 0;

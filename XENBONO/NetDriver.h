@@ -206,3 +206,5 @@ public:
 	int32 ServerReplicateActors_PrioritizeActors(UNetConnection* Connection, const std::vector<FNetViewer>& ConnectionViewers, const std::vector<FNetworkObjectInfo*> ConsiderList, const bool bCPUSaturated, FActorPriority*& OutPriorityList, FActorPriority**& OutPriorityActors);
 	FNetworkObjectList& GetNetworkObjectList();
 };
+
+int ActorChannelCount(class AActor* Actor, int* OutLevelInitialized);

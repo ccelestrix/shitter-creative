@@ -9,6 +9,7 @@
 #include "GameplayStatics.h"
 #include "KismetStringLibrary.h"
 #include "BuildingSMActor.h"
+#include "NetDriver.h"
 #include "FortPlayerStateAthena.h"
 #include <algorithm>
 #include <map>
@@ -659,8 +660,111 @@ void CreativeIsland::StartActorProbe(const std::string& Label, AActor* Anchor)
 	Probes.push_back(std::move(Probe));
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Pieces players build: do they replicate? (A piece the client never gets is invisible there, and the client then builds on the ground next to it.)
+// ---------------------------------------------------------------------------------------------------------------------
+struct PieceWatch
+{
+	AActor* Actor;
+	std::string Name;
+	ULONGLONG Placed;
+};
+
+static std::vector<PieceWatch> PieceWatches;
+static int PieceWatchesLogged = 0;
+
+void CreativeIsland::WatchPiece(AActor* Piece)
+{
+	if (!Piece)
+		return;
+
+	// make sure the piece replicates (the same nudge the prefab pieces get)
+	{
+		static auto ReplicatesOffset = Piece->GetOffset("bReplicates", false);
+		static auto ReplicatesMask = ReplicatesOffset == -1 ? (uint8_t)0 : GetFieldMask(Piece->GetProperty("bReplicates"));
+		static auto SetReplicatesFn = FindObject<UFunction>(L"/Script/Engine.Actor.SetReplicates");
+
+		const bool bReplicates = ReplicatesOffset != -1 && ReplicatesMask && Piece->ReadBitfieldValue(ReplicatesOffset, ReplicatesMask);
+
+		if (!bReplicates && SetReplicatesFn)
+		{
+			bool bNew = true;
+			Piece->ProcessEvent(SetReplicatesFn, &bNew);
+			LOG_WARN(LogCreative, "Piece watch: {} did not replicate, it does now", Piece->GetName());
+		}
+
+		Piece->FlushNetDormancy();
+		Piece->ForceNetUpdate();
+	}
+
+	if (PieceWatchesLogged + (int)PieceWatches.size() >= 40)
+		return;
+
+	PieceWatches.push_back({ Piece, Piece->GetName(), GetTickCount64() });
+}
+
+static bool PieceAlive(void* Object)
+{
+	if (!Object || !Readable(Object, 0x30))
+		return false;
+
+	if (ChunkedObjects)
+		return ChunkedObjects->IsValid((UObject*)Object);
+
+	if (UnchunkedObjects)
+		return UnchunkedObjects->IsValid((UObject*)Object);
+
+	return true;
+}
+
+static void CheckPieceWatches()
+{
+	if (PieceWatches.empty())
+		return;
+
+	const ULONGLONG Now = GetTickCount64();
+
+	for (size_t i = 0; i < PieceWatches.size();)
+	{
+		auto Watch = PieceWatches[i];
+
+		if (Now - Watch.Placed < 1500)
+		{
+			++i;
+			continue;
+		}
+
+		PieceWatches.erase(PieceWatches.begin() + i);
+		++PieceWatchesLogged;
+
+		if (!PieceAlive(Watch.Actor))
+		{
+			LOG_INFO(LogCreative, "Piece watch: {} no longer exists", Watch.Name);
+			continue;
+		}
+
+		auto Actor = Watch.Actor;
+		int LevelInitialized = -1;
+		const int Channels = ActorChannelCount(Actor, &LevelInitialized);
+
+		auto Bit = [&](const char* Property) -> int {
+			const int Offset = Actor->GetOffset(Property, false);
+			return Offset == -1 ? -1 : (int)Actor->ReadBitfieldValue(Offset, GetFieldMask(Actor->GetProperty(Property)));
+		};
+		auto Byte = [&](const char* Property) -> int {
+			const int Offset = Actor->GetOffset(Property, false);
+			return Offset == -1 ? -1 : (int)*(unsigned char*)((char*)Actor + Offset);
+		};
+
+		LOG_INFO(LogCreative, "Piece watch: {} at {}: {} client connections have a channel for it, level initialised {}, bReplicates {}, RemoteRole {}, NetDormancy {}, hidden {}, always relevant {}", Watch.Name, Where(Actor), Channels,
+			LevelInitialized, Bit("bReplicates"), Byte("RemoteRole"), Byte("NetDormancy"), Bit("bHidden"), Bit("bAlwaysRelevant"));
+	}
+}
+
 void CreativeIsland::TickProbes()
 {
+	CheckPieceWatches();
+
 	if (Probes.empty())
 		return;
 
@@ -2644,14 +2748,25 @@ static std::vector<MapActor> ReadDeviceMap(const std::string& Device)
 	std::vector<MapActor>& Result = Cache[Device];
 	static auto WorldClass = FindObject<UClass>(L"/Script/Engine.World");
 
-	// the map: CP_Devices_<Name> in the devices map folder
+	// the map: CP_Devices_<Name> in the devices map folder (listed once, recursively: listing that folder on its own came back empty)
+	static std::vector<std::pair<std::string, std::string>> DeviceMaps;
+	static bool bListed = false;
+
+	if (!bListed)
+	{
+		bListed = true;
+
+		for (auto& Entry : RegistryAssets("/Game/Creative", true))
+			if (Entry.second == "World" && Entry.first.find("/Maps/Devices/") != std::string::npos)
+				DeviceMaps.push_back(Entry);
+
+		LOG_INFO(LogCreative, "Device maps: the registry lists {} maps under /Game/Creative/Maps/Devices", (int)DeviceMaps.size());
+	}
+
 	std::string Package;
 
-	for (auto& [Name, Class] : RegistryAssets("/Game/Creative/Maps/Devices", false))
+	for (auto& [Name, Class] : DeviceMaps)
 	{
-		if (Class != "World")
-			continue;
-
 		const auto Short = LowerText(Name.substr(Name.find_last_of('/') + 1));
 
 		if (Short == "cp_devices_" + LowerText(Device))

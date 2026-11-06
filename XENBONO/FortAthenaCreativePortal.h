@@ -113,6 +113,8 @@ namespace CreativeIsland
 	void LogPakFiles();
 	/** Writes which playsets, props and records the game has loaded and what data they carry. Must run on the game thread. */
 	void DumpCreativeData(const char* Why);
+	/** A piece a player just built: makes sure it replicates, and a moment later writes whether a client has a channel for it. */
+	void WatchPiece(class AActor* Piece);
 }
 
 // Start Game / End Game. The game's server-side minigame flow is missing from this executable: after Start the island's minigame stops in
