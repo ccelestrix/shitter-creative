@@ -179,6 +179,7 @@ struct PhoneKick
 };
 
 static std::map<UObject*, PhoneKick> PhoneKicks;
+static void CheckCreativeHud(AFortPlayerControllerAthena* Controller, const char* When, bool bFix);
 
 static UFortItemDefinition* CreativePhoneItem()
 {
@@ -231,6 +232,7 @@ static void TickPhone()
 
 			LOG_INFO(LogCreative, "Creative phone for {}: {} in the inventory ({}), telling the client again (attempt {})", Controller->GetName(), bHas ? "it is" : "it is NOT", bHad ? "it was already" : "it was put there now",
 				It->second.Attempt);
+			CheckCreativeHud(Controller, "phone kick", true);
 			CreativeIsland::CallOnRep(Controller, "ClientCreativePhoneCreated");
 
 			if (--It->second.Left <= 0)
@@ -264,6 +266,7 @@ void CreativeIsland::GiveCreativePhone(AFortPlayerControllerAthena* Controller)
 	const bool bHas = PutPhoneInInventory(Controller);
 
 	LOG_INFO(LogCreative, "Gave {} the creative phone ({}, now {})", Controller->GetName(), bHad ? "it had it already" : "it did not have it", bHas ? "in the inventory" : "NOT in the inventory");
+	CheckCreativeHud(Controller, "phone granted", true);
 	CallOnRep(Controller, "ClientCreativePhoneCreated");
 
 	// told again 1.5 s, 5 s, 8.5 s and 12 s later (the first call comes before the client has the item)
@@ -2118,7 +2121,30 @@ static ABuildingSMActor* SpawnPiece(UClass* Class, double X, double Y, double Z,
 
 	// Only a building piece is told it was placed by a player; other actors (props) are left as they spawn.
 	if (BuildingSMClass && InheritsFrom(Class, BuildingSMClass))
+	{
 		Piece->SetPlayerPlaced(true);
+
+		// The game's structural check destroys a piece nothing supports: the log of the 6 Nov test shows five roof pieces of the barn collapsing within a second of
+		// it being built (BlueprintOnStructurallyUnstable, then RemoveActorWhenDied), which is why prefabs came out with holes in them. The set pieces are
+		// scenery, held up by nothing the game's grid can see, so they are marked as supported (ABuildingSMActor::bForciblyStructurallySupported).
+		static auto ForcedOffset = Piece->GetOffset("bForciblyStructurallySupported", false);
+		static auto ForcedMask = ForcedOffset == -1 ? (uint8_t)0 : GetFieldMask(Piece->GetProperty("bForciblyStructurallySupported"));
+		static int Marked = 0;
+
+		if (ForcedOffset != -1 && ForcedMask)
+		{
+			Piece->SetBitfieldValue(ForcedOffset, ForcedMask, true);
+
+			if (++Marked == 1)
+			{
+				LOG_INFO(LogCreative, "Own prefab: pieces are marked as structurally supported (bForciblyStructurallySupported at 0x{:x}, now {})", ForcedOffset, (int)Piece->ReadBitfieldValue(ForcedOffset, ForcedMask));
+			}
+		}
+		else if (Marked == 0)
+		{
+			LOG_WARN(LogCreative, "Own prefab: {} has no bForciblyStructurallySupported, its pieces can collapse", Class->GetName());
+		}
+	}
 
 	if (BuildingClass && InheritsFrom(Class, BuildingClass))
 	{
@@ -2953,6 +2979,146 @@ static UObject* SafeLoadAsset(UClass* Class, const wchar_t* Path)
 	}
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// The creative HUD of a player: the phone's quickbar and the menus behind it. The SDK shows what the client needs from the server: the controller's
+// replicated flags bIsCreativeModeEnabled and bIsCreativeQuickbarEnabled (both repnotify) and its replicated CreativeQuickbarComponent, which the game makes
+// from the CreativeQuickbarClass it holds. Nothing in this project ever set the flags or checked the component, so the phone could be in the inventory
+// and the client still had no creative HUD to put it in. This writes down what the controller really has, and fills in what is missing.
+// ---------------------------------------------------------------------------------------------------------------------
+static UObject* QuickbarOf(UObject* Controller)
+{
+	const int Offset = Controller ? Controller->GetOffset("CreativeQuickbarComponent", false) : -1;
+	return Offset == -1 ? nullptr : Controller->Get<UObject*>(Offset);
+}
+
+static void CheckCreativeHud(AFortPlayerControllerAthena* Controller, const char* When, bool bFix)
+{
+	if (!Controller)
+		return;
+
+	struct HudFlag
+	{
+		const char* Name;
+		const char* OnRep;
+		bool bOnRepGetsPrevious;
+	};
+
+	static const HudFlag Flags[] = {
+		{ "bIsCreativeModeEnabled", "OnRep_IsCreativeModeEnabled", false },
+		{ "bIsCreativeQuickbarEnabled", "OnRep_IsCreativeQuickbarEnabled", true },
+		{ "bIsCreativeQuickmenuEnabled", nullptr, false },
+	};
+
+	std::string Text;
+
+	for (auto& Flag : Flags)
+	{
+		const int Offset = Controller->GetOffset(Flag.Name, false);
+		void* Property = Offset == -1 ? nullptr : Controller->GetProperty(Flag.Name, false);
+
+		if (!Property)
+		{
+			Text += std::format("{} n/a; ", Flag.Name);
+			continue;
+		}
+
+		const uint8_t Mask = GetFieldMask(Property);
+		const bool bOn = Controller->ReadBitfieldValue(Offset, Mask);
+
+		if (bOn || !bFix)
+		{
+			Text += std::format("{} {}; ", Flag.Name, bOn ? "on" : "OFF");
+			continue;
+		}
+
+		Controller->SetBitfieldValue(Offset, Mask, true);
+
+		if (Flag.OnRep)
+			if (auto Function = Controller->FindFunction(Flag.OnRep))
+			{
+				bool bPrevious = false;
+				SafeProcessEvent(Controller, Function, Flag.bOnRepGetsPrevious ? &bPrevious : nullptr);
+			}
+
+		Text += std::format("{} was OFF, set; ", Flag.Name);
+	}
+
+	LOG_INFO(LogCreative, "Creative HUD ({}) of {}: {}", When, Controller->GetName(), Text);
+
+	if (!bFix)
+		return;
+
+	auto Quickbar = QuickbarOf(Controller);
+
+	if (Quickbar)
+	{
+		LOG_INFO(LogCreative, "Creative HUD ({}): the quickbar component is {}", When, Describe(Quickbar));
+		return;
+	}
+
+	// the game's own callback for the phone (it may make the component)
+	if (auto Callback = Controller->FindFunction("GrantCreativePhoneItemDefLoadedCallback"))
+		SafeProcessEvent(Controller, Callback, nullptr);
+
+	Quickbar = QuickbarOf(Controller);
+
+	if (Quickbar)
+	{
+		LOG_INFO(LogCreative, "Creative HUD ({}): the game's callback made the quickbar component {}", When, Describe(Quickbar));
+		return;
+	}
+
+	// otherwise it is made here, from the class the controller holds
+	const int ClassOffset = Controller->GetOffset("CreativeQuickbarClass", false);
+	UClass* Class = nullptr;
+	std::string ClassPath = "n/a";
+
+	if (ClassOffset != -1)
+	{
+		auto& Soft = Controller->Get<TSoftObjectPtr<UObject>>(ClassOffset);
+
+		if (Soft.IsValid())
+		{
+			ClassPath = Soft.SoftObjectPtr.ObjectID.AssetPathName.ToString();
+			const std::wstring Path(ClassPath.begin(), ClassPath.end());
+			static auto ClassClass = FindObject<UClass>(L"/Script/CoreUObject.Class");
+			Class = (UClass*)FindObject<UObject>(Path.c_str());
+
+			if (!Class)
+				Class = (UClass*)SafeLoadAsset(ClassClass, Path.c_str());
+		}
+		else
+			ClassPath = "not set";
+	}
+
+	if (!Class)
+	{
+		LOG_WARN(LogCreative, "Creative HUD ({}): {} has no quickbar component and its quickbar class ({}) could not be loaded", When, Controller->GetName(), ClassPath);
+		return;
+	}
+
+	auto Made = UGameplayStatics::SpawnObject(Class, Controller);
+
+	if (!Made)
+	{
+		LOG_WARN(LogCreative, "Creative HUD ({}): making the quickbar component from {} failed", When, ClassPath);
+		return;
+	}
+
+	Controller->Get<UObject*>(Controller->GetOffset("CreativeQuickbarComponent")) = Made;
+
+	if (auto Replicate = Made->FindFunction("SetIsReplicated"))
+	{
+		bool bReplicate = true;
+		SafeProcessEvent(Made, Replicate, &bReplicate);
+	}
+
+	CreativeIsland::CallOnRep(Controller, "OnRep_CreativeQuickbarComponent");
+	Controller->ForceNetUpdate();
+	LOG_INFO(LogCreative, "Creative HUD ({}): made the quickbar component {} from {}", When, Describe(Made), ClassPath);
+	PropDump::DumpObject("Quickbar component", Made, 1, 40);
+}
+
 struct MapActor
 {
 	UClass* Class = nullptr;
@@ -3475,6 +3641,501 @@ namespace CreativeSettings
 			bV2 ? (V2.ReturnValue ? "yes" : "no") : "unknown");
 	}
 
+	// ------------------------------------------------------------------------------------------------------------------
+	// When the game's own handler leaves a device's options unset. The SDK says what an options asset is (a list of options, each with a key and, for the
+	// choices, named values), what the component keeps (PlayerOptionData: the overrides, a base object they apply to) and that the actor has a property with
+	// the option's name, so this first writes down what is really there, then helps in steps: the base object, the component's own setters again, and last
+	// the actor's properties set directly (with the override list updated so the clients get them too).
+	// ------------------------------------------------------------------------------------------------------------------
+	struct Color4 { float R, G, B, A; };
+
+	struct ValueName
+	{
+		std::string Display, Name;
+	};
+
+	struct OptionDef
+	{
+		UObject* Object = nullptr;
+		std::string Class, Key;
+		std::vector<ValueName> Values;
+		std::vector<long long> Ints;
+		std::vector<Color4> Colors;
+		std::vector<float> Floats;
+	};
+
+	static std::string Lower(std::string Text)
+	{
+		for (auto& Letter : Text)
+			Letter = (char)std::tolower((unsigned char)Letter);
+
+		return Text;
+	}
+
+	// An FText held in memory as plain text, through the game's own text library.
+	static std::string TextAt(const void* Address)
+	{
+		static auto Function = FindObject<UFunction>(L"/Script/Engine.KismetTextLibrary.Conv_TextToString");
+		static auto Library = FindObject<UObject>(L"/Script/Engine.Default__KismetTextLibrary");
+
+		if (!Function || !Library || !Readable(Address, 0x18))
+			return std::string();
+
+		struct { char Text[0x18]; char Result[0x10]; } Params{};
+		memcpy(Params.Text, Address, 0x18);
+
+		return SafeProcessEvent(Library, Function, &Params) ? TextOf(*(const FString*)Params.Result) : std::string();
+	}
+
+	// The options an options asset (PlaylistUserOptions) lists: TArray<PlaylistUserOptionBase*> at +0x38; each has its key at +0x70, the choices a table at +0xE8.
+	static std::vector<OptionDef> ReadOptionDefs(UObject* Asset)
+	{
+		std::vector<OptionDef> Result;
+
+		if (!Asset || !PropDump::IsLiveObject(Asset))
+			return Result;
+
+		const char* Base = (const char*)Asset;
+		const char* Data = *(const char* const*)(Base + 0x38);
+		const int Num = *(const int*)(Base + 0x40);
+
+		if (Num <= 0 || Num > 500 || !Readable(Data, (size_t)Num * 8))
+			return Result;
+
+		for (int i = 0; i < Num; ++i)
+		{
+			auto Object = ((UObject* const*)Data)[i];
+
+			if (!PropDump::IsLiveObject(Object) || !Object->ClassPrivate)
+				continue;
+
+			OptionDef Def;
+			Def.Object = Object;
+			Def.Class = Object->ClassPrivate->GetName();
+			const char* O = (const char*)Object;
+
+			if (Readable(O + 0x70, 0x10))
+				Def.Key = TextOf(*(const FString*)(O + 0x70));
+
+			size_t Stride = 0;
+
+			if (Def.Class == "PlaylistUserOptionEnum") Stride = 0x28;
+			else if (Def.Class == "PlaylistUserOptionIntEnum") Stride = 0x30;
+			else if (Def.Class == "PlaylistUserOptionColorEnum") Stride = 0x38;
+			else if (Def.Class == "PlaylistUserOptionFloatEnum") Stride = 0x48;
+
+			if (Stride && Readable(O + 0xE8, 0x10))
+			{
+				const char* Values = *(const char* const*)(O + 0xE8);
+				const int Count = *(const int*)(O + 0xF0);
+
+				if (Count > 0 && Count < 200 && Readable(Values, (size_t)Count * Stride))
+					for (int j = 0; j < Count; ++j)
+					{
+						const char* Entry = Values + (size_t)j * Stride;
+						Def.Values.push_back({ TextAt(Entry), TextOf(*(const FString*)(Entry + 0x18)) });
+
+						if (Stride == 0x30)
+							Def.Ints.push_back(*(const int*)(Entry + 0x28));
+						else if (Stride == 0x38)
+							Def.Colors.push_back(*(const Color4*)(Entry + 0x28));
+						else if (Stride == 0x48)
+							Def.Floats.push_back(*(const float*)(Entry + 0x28));
+					}
+			}
+
+			Result.push_back(Def);
+		}
+
+		return Result;
+	}
+
+	// What the options asset lists: once for each asset.
+	static void DescribeOptionsAsset(UObject* Asset)
+	{
+		static std::set<UObject*> Done;
+
+		if (!Asset || !Done.insert(Asset).second)
+			return;
+
+		const auto Defs = ReadOptionDefs(Asset);
+		LOG_INFO(LogCreative, "Options asset {}: {} option(s)", Describe(Asset), (int)Defs.size());
+
+		for (auto& Def : Defs)
+		{
+			std::string Values;
+
+			for (size_t i = 0; i < Def.Values.size() && i < 14; ++i)
+			{
+				Values += std::format("{}{}:'{}'/{}", i ? ", " : " ", (int)i, Def.Values[i].Display, Def.Values[i].Name);
+
+				if (i < Def.Ints.size())
+					Values += std::format("={}", Def.Ints[i]);
+				else if (i < Def.Floats.size())
+					Values += std::format("={}", Def.Floats[i]);
+				else if (i < Def.Colors.size())
+					Values += std::format("=({:.2f} {:.2f} {:.2f} {:.2f})", Def.Colors[i].R, Def.Colors[i].G, Def.Colors[i].B, Def.Colors[i].A);
+			}
+
+			LOG_INFO(LogCreative, "Options asset:   {} '{}'{}", Def.Class, Def.Key, Values);
+		}
+	}
+
+	static const OptionDef* FindDef(const std::vector<OptionDef>& Defs, const std::string& Key)
+	{
+		for (auto& Def : Defs)
+			if (Def.Key == Key)
+				return &Def;
+
+		for (auto& Def : Defs)
+			if (Lower(Def.Key) == Lower(Key))
+				return &Def;
+
+		return nullptr;
+	}
+
+	// The index of a named value of a choice option (the request carries the name the screen shows, or the value's own name).
+	static int ValueIndex(const OptionDef& Def, const std::string& Wanted)
+	{
+		const auto W = Lower(Wanted);
+
+		for (size_t i = 0; i < Def.Values.size(); ++i)
+			if (Lower(Def.Values[i].Name) == W)
+				return (int)i;
+
+		for (size_t i = 0; i < Def.Values.size(); ++i)
+			if (Lower(Def.Values[i].Display) == W)
+				return (int)i;
+
+		return -1;
+	}
+
+	static bool ParseNumber(const std::string& Text, double& Value)
+	{
+		if (Text.empty())
+			return false;
+
+		char* End = nullptr;
+		Value = std::strtod(Text.c_str(), &End);
+		return End && *End == 0;
+	}
+
+	static bool ParseBool(const std::string& Text, bool& Value)
+	{
+		const auto T = Lower(Text);
+
+		if (T == "true" || T == "on" || T == "yes" || T == "1" || T == "enabled")
+		{
+			Value = true;
+			return true;
+		}
+
+		if (T == "false" || T == "off" || T == "no" || T == "0" || T == "disabled")
+		{
+			Value = false;
+			return true;
+		}
+
+		return false;
+	}
+
+	// What the options component keeps: PlayerOptionData (the override list, the mode, the object they apply to).
+	struct DataState
+	{
+		int Overrides = 0;
+		int Mode = 0;
+		UObject* Base = nullptr;
+		UObject* Mutable = nullptr;
+	};
+
+	static char* DataOf(UObject* Component)
+	{
+		const int Offset = Component ? Component->GetOffset("PlayerOptionData", false) : -1;
+		return Offset > 0 && Readable((char*)Component + Offset, 0x50) ? (char*)Component + Offset : nullptr;
+	}
+
+	static bool ReadData(UObject* Component, DataState& State)
+	{
+		const char* Data = DataOf(Component);
+
+		if (!Data)
+			return false;
+
+		State.Overrides = *(const int*)(Data + 8);
+		State.Mode = *(const unsigned char*)(Data + 0x38);
+		State.Base = *(UObject* const*)(Data + 0x40);
+		State.Mutable = *(UObject* const*)(Data + 0x48);
+		return true;
+	}
+
+	// The component and its data, written down: the first time for every kind of component with all its properties.
+	static void LogComponent(const char* When, UObject* Component)
+	{
+		if (!Component)
+			return;
+
+		static std::set<std::string> Dumped;
+		DataState State;
+		static const int AssetOffset = Component->GetOffset("PlayerOptions", false);
+		const auto Asset = AssetOffset > 0 ? Component->Get<UObject*>(AssetOffset) : nullptr;
+
+		if (ReadData(Component, State))
+		{
+			LOG_INFO(LogCreative, "Options component ({}): {} has {} override(s), mode {}, base object {}, mutable object {}, options asset {}", When, Describe(Component), State.Overrides, State.Mode,
+				Describe(State.Base), Describe(State.Mutable), Describe(Asset));
+		}
+		else
+		{
+			LOG_WARN(LogCreative, "Options component ({}): {} has no readable PlayerOptionData", When, Describe(Component));
+		}
+
+		DescribeOptionsAsset(Asset);
+
+		const std::string ClassName = Component->ClassPrivate ? Component->ClassPrivate->GetName() : std::string("?");
+
+		if (Dumped.insert(ClassName).second)
+			PropDump::DumpObject("Options component " + ClassName, Component, 2, 120);
+	}
+
+	// The object the overrides are applied to is empty when the component was never set up for its actor: it is the actor.
+	static bool RepairData(UObject* Component, UObject* Owner)
+	{
+		DataState State;
+
+		if (!Owner || !ReadData(Component, State) || State.Base)
+			return false;
+
+		*(UObject**)(DataOf(Component) + 0x40) = Owner;
+		LOG_WARN(LogCreative, "Settings:   the options of {} had no base object, set to the actor", Describe(Component));
+		return true;
+	}
+
+	// Writes an option into the actor's property of that name. Returns what was done ("" when it could not be).
+	static std::string SetActorProperty(UObject* Actor, const OptionDef* Def, const Option& Wanted, std::string& Why)
+	{
+		auto Property = (const char*)Actor->GetProperty(Wanted.Key, false);
+
+		if (!Property)
+		{
+			Why = "the actor has no property of that name";
+			return std::string();
+		}
+
+		const std::string Type = PropDump::TypeOf(Property);
+		const int Offset = *(const int*)(Property + Offsets::Offset_Internal);
+		const int Size = *(const int*)(Property + PropDump::ElementSizeAt);
+		char* Address = (char*)Actor + Offset;
+
+		if (Offset <= 0 || Size <= 0 || !Readable(Address, (size_t)Size))
+		{
+			Why = "the property is unreadable";
+			return std::string();
+		}
+
+		const int Index = Def ? ValueIndex(*Def, Wanted.Value) : -1;
+		double Number = 0;
+		const bool bNumber = ParseNumber(Wanted.Value, Number);
+
+		if (Type == "StrProperty")
+		{
+			MakeString(Address, Wanted.Value);
+			return "text";
+		}
+
+		if (Type == "BoolProperty")
+		{
+			bool bValue = false;
+
+			if (!ParseBool(Wanted.Value, bValue))
+			{
+				if (Index < 0 && !bNumber)
+				{
+					Why = "not a yes/no value";
+					return std::string();
+				}
+
+				bValue = Index >= 0 ? Index != 0 : Number != 0;
+			}
+
+			Actor->SetBitfieldValue(Offset, GetFieldMask((void*)Property), bValue);
+			return bValue ? "yes" : "no";
+		}
+
+		if (Type == "IntProperty")
+		{
+			long long Value;
+
+			if (Index >= 0)
+				Value = Index < (int)Def->Ints.size() ? Def->Ints[Index] : Index;
+			else if (bNumber)
+				Value = (long long)Number;
+			else
+			{
+				Why = "no such choice";
+				return std::string();
+			}
+
+			*(int*)Address = (int)Value;
+			return std::to_string(Value);
+		}
+
+		if (Type == "ByteProperty" || Type == "EnumProperty")
+		{
+			const void* Enum = *(const void* const*)(Property + (Type == "ByteProperty" ? PropDump::InnerAt : PropDump::SecondAt));
+			int Value = -1;
+
+			// the enum's own value of that name (Left, Center, Right ...), else the place in the list
+			if (Enum)
+				for (int v = 0; v < 64 && Value < 0; ++v)
+					if (Lower(PropDump::EnumName(Enum, v)) == Lower(Wanted.Value))
+						Value = v;
+
+			if (Value < 0)
+				Value = Index >= 0 ? Index : (bNumber ? (int)Number : -1);
+
+			if (Value < 0)
+			{
+				Why = "no such choice";
+				return std::string();
+			}
+
+			if (Size == 1) *(unsigned char*)Address = (unsigned char)Value;
+			else if (Size == 2) *(short*)Address = (short)Value;
+			else if (Size == 4) *(int*)Address = Value;
+			else
+			{
+				Why = "an unexpected enum size";
+				return std::string();
+			}
+
+			return std::to_string(Value);
+		}
+
+		if (Type == "FloatProperty")
+		{
+			float Value;
+
+			if (Index >= 0)
+				Value = Index < (int)Def->Floats.size() ? Def->Floats[Index] : (float)Index;
+			else if (bNumber)
+				Value = (float)Number;
+			else
+			{
+				Why = "no such choice";
+				return std::string();
+			}
+
+			*(float*)Address = Value;
+			return std::to_string(Value);
+		}
+
+		if (Type == "StructProperty")
+		{
+			const void* Struct = *(const void* const*)(Property + PropDump::InnerAt);
+			const std::string StructName = PropDump::IsLiveObject(Struct) ? ((UObject*)Struct)->GetName() : std::string();
+
+			if (StructName == "LinearColor" && Def && Index >= 0 && Index < (int)Def->Colors.size() && Size == 16)
+			{
+				memcpy(Address, &Def->Colors[Index], 16);
+				return "a color";
+			}
+
+			Why = "a " + StructName + " property that has no value of that name";
+			return std::string();
+		}
+
+		Why = "a " + Type + " is not handled";
+		return std::string();
+	}
+
+	// The override list the component replicates: one entry for each option (scope, name, value as text, default), changed in place or added.
+	static int MirrorToData(UObject* Component, const std::vector<Option>& Values)
+	{
+		char* Data = DataOf(Component);
+
+		if (!Data)
+			return 0;
+
+		int Done = 0;
+
+		for (auto& V : Values)
+		{
+			char*& Elements = *(char**)Data;
+			int& Num = *(int*)(Data + 8);
+			int& Max = *(int*)(Data + 12);
+
+			if (Num < 0 || Num > 5000 || (Num > 0 && !Readable(Elements, (size_t)Num * 0x48)))
+				return Done;
+
+			bool bFound = false;
+
+			for (int i = 0; i < Num && !bFound; ++i)
+				if (TextOf(*(const FString*)(Elements + (size_t)i * 0x48 + 0x10)) == V.Key)
+				{
+					MakeString(Elements + (size_t)i * 0x48 + 0x20, V.Value);
+					bFound = true;
+				}
+
+			if (!bFound)
+			{
+				Elements = (char*)FMemory::Realloc(Num > 0 ? Elements : nullptr, (size_t)(Num + 1) * 0x48, 0);
+				char* Entry = Elements + (size_t)Num * 0x48;
+				memset(Entry, 0, 0x48);
+				MakeString(Entry + 0x10, V.Key);
+				MakeString(Entry + 0x20, V.Value);
+				++Num;
+				Max = Num;
+			}
+
+			++Done;
+		}
+
+		return Done;
+	}
+
+	// The actor's properties set by hand (and told about it), the override list updated. Returns how many options were set.
+	static int ApplyToActor(UObject* Actor, UObject* Component, const std::vector<Option>& Wanted)
+	{
+		static const int AssetOffset = Component->GetOffset("PlayerOptions", false);
+		const auto Defs = ReadOptionDefs(AssetOffset > 0 ? Component->Get<UObject*>(AssetOffset) : nullptr);
+		std::vector<Option> Applied;
+
+		for (auto& W : Wanted)
+		{
+			const OptionDef* Def = FindDef(Defs, W.Key);
+			std::string Why;
+			const auto What = SetActorProperty(Actor, Def, W, Why);
+
+			if (What.empty())
+			{
+				LOG_WARN(LogCreative, "Settings:     {} = {}: not set on the actor ({}; {})", W.Key, W.Value, Why, Def ? "the options asset lists it as " + Def->Class : std::string("the options asset does not list it"));
+				continue;
+			}
+
+			LOG_INFO(LogCreative, "Settings:     {} = {}: set on the actor ({}, option is {})", W.Key, W.Value, What, Def ? Def->Class : std::string("not listed"));
+			Applied.push_back(W);
+
+			// a property the actor replicates tells its clients through the on-rep function; run it here too so the server's own copy follows
+			if (auto OnRep = Actor->FindFunction("OnRep_" + W.Key))
+				SafeProcessEvent(Actor, OnRep, nullptr);
+		}
+
+		const int Mirrored = MirrorToData(Component, Applied);
+
+		if (Mirrored > 0)
+		{
+			DataState State;
+
+			if (ReadData(Component, State) && State.Base)
+				if (auto OnRepData = Component->FindFunction("OnRep_PlayerOptionData"))
+					SafeProcessEvent(Component, OnRepData, nullptr);
+
+			LOG_INFO(LogCreative, "Settings:     {} override(s) written to the component's list", Mirrored);
+		}
+
+		return (int)Applied.size();
+	}
+
 	// The change of an actor's options, before and after the game's own handler.
 	static void HandleActorOptions(UObject* Controller, void* Params, bool bAfter)
 	{
@@ -3493,6 +4154,7 @@ namespace CreativeSettings
 			if (Component && CurrentOptions(Component, Before))
 				LOG_INFO(LogCreative, "Settings:   before: {} option(s) set: {}", (int)Before.size(), Summary(Before));
 
+			LogComponent("before the game's handler", Component);
 			LogEditAccess(Component, ControllerPawn(Controller));
 			return;
 		}
@@ -3514,20 +4176,48 @@ namespace CreativeSettings
 		if (Set >= (int)Wanted.size())
 			return;
 
-		// the game did not take them: set them through the component
-		std::vector<Option> Missing;
+		auto MissingOf = [&]() {
+			std::vector<Option> Missing;
 
-		for (auto& W : Wanted)
-			if (Matching({ W }, Now) == 0)
-				Missing.push_back(W);
+			for (auto& W : Wanted)
+				if (Matching({ W }, Now) == 0)
+					Missing.push_back(W);
 
+			return Missing;
+		};
+
+		auto Missing = MissingOf();
 		LOG_WARN(LogCreative, "Settings:   {} option(s) were not applied, setting them: {}", (int)Missing.size(), Summary(Missing));
+		LogComponent("after the game's handler", Component);
+
+		// 1. the component's own setters (after giving it the object it applies the options to, when it has none)
+		const bool bRepaired = RepairData(Component, R.Target);
 		ApplyOptions(Component, Missing);
+
+		if (CurrentOptions(Component, Now) && !MissingOf().empty())
+		{
+			// 2. the overrides the component still holds back
+			if (auto Resolve = Component->FindFunction("ResolvePendingRepOverrides"))
+			{
+				SafeProcessEvent(Component, Resolve, nullptr);
+				CurrentOptions(Component, Now);
+			}
+		}
+
+		Missing = MissingOf();
+
+		// 3. the actor's properties directly
+		if (!Missing.empty())
+		{
+			LOG_WARN(LogCreative, "Settings:   the component did not take {} option(s){}, setting the actor's properties directly", (int)Missing.size(), bRepaired ? " (even with a base object)" : "");
+			const int Direct = ApplyToActor(R.Target, Component, Missing);
+			LOG_INFO(LogCreative, "Settings:   {} of {} option(s) set on the actor", Direct, (int)Missing.size());
+		}
 
 		if (CurrentOptions(Component, Now))
 		{
 			Set = Matching(Wanted, Now);
-			LOG_INFO(LogCreative, "Settings:   after our own change: {} of {} requested option(s) are set: {}", Set, (int)Wanted.size(), Summary(Now));
+			LOG_INFO(LogCreative, "Settings:   after our own change: {} of {} requested option(s) are in the component's list: {}", Set, (int)Wanted.size(), Summary(Now));
 		}
 
 		if (auto Actor = (AActor*)R.Target)
@@ -3693,6 +4383,7 @@ namespace CreativeSettings
 			CurrentOptions(Component, Set);
 
 			LOG_INFO(LogCreative, "Device check:   options asset {}, {} option(s) set: {}", Describe(OptionsAssetOffset == -1 ? nullptr : Component->Get<UObject*>(OptionsAssetOffset)), (int)Set.size(), Summary(Set, 8));
+			LogComponent("when placed", Component);
 			LogEditAccess(Component, ControllerPawn(BuilderController));
 		}
 
