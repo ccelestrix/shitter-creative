@@ -1930,6 +1930,191 @@ static int BuildOwnPrefab(AFortVolume* Volume, UObject* Playset)
 	return Walls + Floors;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Our own devices. The playsets of the devices (PID_CP_Devices_<Name>) point at nothing, but the asset registry lists a map CP_Devices_<Name> and
+// the device's blueprints under /Game/Creative/Devices/<Name> for each of them. The device's actor class is looked up there and spawned in the
+// volume the grenade made.
+// ---------------------------------------------------------------------------------------------------------------------
+// Everything the asset registry lists under a package path, as (package name, asset class).
+static std::vector<std::pair<std::string, std::string>> RegistryAssets(const std::string& PackagePath, bool bRecursive)
+{
+	std::vector<std::pair<std::string, std::string>> Result;
+
+	static auto Helpers = FindObject<UObject>(L"/Script/AssetRegistry.Default__AssetRegistryHelpers");
+	auto GetRegistryFn = Helpers ? Helpers->FindFunction("GetAssetRegistry") : nullptr;
+
+	if (!GetRegistryFn)
+		return Result;
+
+	struct { UObject* Object; void* Interface; } Registry{};
+
+	if (!SafeProcessEvent(Helpers, GetRegistryFn, &Registry) || !PropDump::IsLiveObject(Registry.Object))
+		return Result;
+
+	auto ByPathFn = Registry.Object->FindFunction("GetAssetsByPath");
+
+	if (!ByPathFn)
+		return Result;
+
+	const std::wstring Wide(PackagePath.begin(), PackagePath.end());
+
+	struct { FName PackagePath; TArray<char> OutAssetData; bool bRecursive; bool bIncludeOnlyOnDiskAssets; bool ReturnValue; } Params{};
+	Params.PackagePath = UKismetStringLibrary::Conv_StringToName(Wide.c_str());
+	Params.bRecursive = bRecursive;
+	Params.bIncludeOnlyOnDiskAssets = false;
+
+	if (!SafeProcessEvent(Registry.Object, ByPathFn, &Params))
+		return Result;
+
+	for (int i = 0; i < Params.OutAssetData.Num() && i < 5000; ++i)
+	{
+		const char* Asset = (const char*)Params.OutAssetData.GetData() + (size_t)i * 0x50;
+
+		if (!Readable(Asset, 0x50))
+			break;
+
+		Result.push_back({ NameAt(Asset + 0x08), NameAt(Asset + 0x20) });
+	}
+
+	return Result;
+}
+
+static bool InheritsFrom(UClass* Class, UClass* Base)
+{
+	int Guard = 0;
+
+	for (auto S = (UStruct*)Class; S && Guard < 64; S = S->GetSuperStruct(), ++Guard)
+		if (S == (UStruct*)Base)
+			return true;
+
+	return false;
+}
+
+// The actor class of a device: a blueprint in the device's folder that is a building actor.
+static UClass* FindDeviceClass(const std::string& Device)
+{
+	static auto BuildingActorClass = FindObject<UClass>(L"/Script/FortniteGame.BuildingActor");
+	static auto ClassClass = FindObject<UClass>(L"/Script/CoreUObject.Class");
+	static std::map<std::string, UClass*> Cache;
+
+	if (auto It = Cache.find(Device); It != Cache.end() && It->second)
+		return It->second;
+
+	auto Assets = RegistryAssets("/Game/Creative/Devices/" + Device, true);
+	std::vector<std::string> Candidates;
+
+	for (auto& [Package, Class] : Assets)
+		if (Class == "Blueprint")
+			Candidates.push_back(Package);
+
+	LOG_INFO(LogCreative, "Own device {}: the registry lists {} assets under /Game/Creative/Devices/{}, {} of them blueprints", Device, (int)Assets.size(), Device, (int)Candidates.size());
+
+	auto NameOf = [](const std::string& Package) { return Package.substr(Package.find_last_of('/') + 1); };
+
+	// the likely actor blueprints first (BP_<Name>, <Name>_GBA)
+	std::stable_sort(Candidates.begin(), Candidates.end(), [&](const std::string& A, const std::string& B) {
+		auto Score = [&](const std::string& Package) {
+			const auto Name = NameOf(Package);
+			return (Name.rfind("BP_", 0) == 0 ? 2 : 0) + (Name.size() > 4 && Name.compare(Name.size() - 4, 4, "_GBA") == 0 ? 2 : 0) + (Name.find(Device) != std::string::npos ? 1 : 0);
+		};
+		return Score(A) > Score(B);
+	});
+
+	for (auto& Package : Candidates)
+	{
+		const auto Name = NameOf(Package);
+
+		// abilities, effects, cues and the like are not the device
+		if (Name.rfind("GA_", 0) == 0 || Name.rfind("GE_", 0) == 0 || Name.rfind("GC_", 0) == 0 || Name.rfind("GCN_", 0) == 0 || Name.rfind("W_", 0) == 0 || Name.rfind("WBP_", 0) == 0)
+			continue;
+
+		const std::string PathText = Package + "." + Name + "_C";
+		const std::wstring Path(PathText.begin(), PathText.end());
+
+		UClass* Class = FindObject<UClass>(Path.c_str());
+
+		if (!Class)
+			Class = LoadObject<UClass>(Path.c_str(), ClassClass);
+
+		LOG_INFO(LogCreative, "Own device {}: candidate {} -> {}{}", Device, PathText, Class ? "loaded" : "could not be loaded", Class && !InheritsFrom(Class, BuildingActorClass) ? " (not a building actor)" : "");
+
+		if (Class && InheritsFrom(Class, BuildingActorClass))
+		{
+			Cache[Device] = Class;
+			return Class;
+		}
+	}
+
+	return nullptr;
+}
+
+// Returns 1 when a device was spawned.
+static int BuildOwnDevice(AFortVolume* Volume, UObject* Playset)
+{
+	const std::string Name = Playset->GetName();
+	const std::string Prefix = "PID_CP_Devices_";
+
+	if (Name.rfind(Prefix, 0) != 0)
+		return 0;
+
+	const std::string Device = Name.substr(Prefix.size());
+	auto Class = FindDeviceClass(Device);
+
+	if (!Class)
+	{
+		LOG_WARN(LogCreative, "Own device {}: no actor class was found", Device);
+		return 0;
+	}
+
+	// the thrower, for the team and the build animation
+	static auto ControllerClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerControllerAthena");
+	AFortPlayerControllerAthena* Builder = nullptr;
+	{
+		auto Controllers = UGameplayStatics::GetAllActorsOfClass(GetWorld(), ControllerClass);
+
+		for (int i = 0; i < Controllers.Num() && !Builder; ++i)
+		{
+			auto Controller = (AFortPlayerControllerAthena*)Controllers.at(i);
+			const int PlaysetOffset = Controller ? Controller->GetOffset("CurrentPlayset", false) : -1;
+
+			if (Controller && PlaysetOffset != -1 && Controller->Get<UObject*>(PlaysetOffset) == Playset)
+				Builder = Controller;
+		}
+
+		if (!Builder && Controllers.Num() > 0)
+			Builder = (AFortPlayerControllerAthena*)Controllers.at(0);
+
+		Controllers.Free();
+	}
+
+	int Team = -1;
+
+	if (Builder)
+		if (auto State = Cast<AFortPlayerStateAthena, false>(Builder->GetPlayerState()))
+			Team = State->GetTeamIndex();
+
+	FTransform Transform{};
+	Transform.Translation = Volume->GetActorLocation();
+	Transform.Scale3D = { 1, 1, 1 };
+
+	auto Device_ = GetWorld()->SpawnActor<ABuildingActor>(Class, Transform);
+
+	if (!Device_)
+	{
+		LOG_WARN(LogCreative, "Own device {}: spawning {} failed", Device, Class->GetName());
+		return 0;
+	}
+
+	if (Builder)
+		Device_->InitializeBuildingActor(Builder, Device_, true);
+
+	if (Team >= 0)
+		Device_->SetTeam((unsigned char)Team);
+
+	LOG_INFO(LogCreative, "Own device {}: spawned {} ({}) at {}, builder {}, team {}", Device, Class->GetName(), Describe(Device_), Where(Device_), Describe(Builder), Team);
+	return 1;
+}
+
 void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 {
 	// The grenade's OnLoaded callback fires for every asset it loads (sounds, effects, ...), so only a real playset is used. Anything else is ignored.
@@ -2127,7 +2312,10 @@ void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 		// Our own version of the prefab, built from building pieces.
 		if (Globals::bOwnPrefabs)
 		{
-			const int Built = BuildOwnPrefab(Volume, UsePlayset);
+			int Built = BuildOwnPrefab(Volume, UsePlayset);
+
+			if (Built <= 0)
+				Built = BuildOwnDevice(Volume, UsePlayset);
 
 			if (Built > 0)
 			{
