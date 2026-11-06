@@ -1,0 +1,8 @@
+prefab PID_Test_House 3 3 3
+type Wall_C auto 12 512 40 384 box 0 0 0
+type Window_C auto 4 512 40 384 box 0 0 0
+type Door_C auto 1 512 40 384 box 0 0 0
+type Floor_C auto 9 512 512 30 box 0 0 0
+type Roof_C auto 9 512 640 300 tent 0 0 0
+type Stairs_C auto 1 256 512 384 shed 1 1 0
+type Crate_C auto 4 100 100 100 box 0 0 0

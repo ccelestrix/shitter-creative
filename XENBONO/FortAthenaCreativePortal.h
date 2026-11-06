@@ -117,6 +117,10 @@ namespace CreativeIsland
 	void WatchPiece(class AActor* Piece);
 	/** Every property of an object with its value (see PropDump), to the creative log. */
 	void DumpObjectToLog(const std::string& Label, UObject* Object, int Depth, int MaxLines);
+	/** Starts describing every prefab in the log (the pieces each is made of and their measurements), one playset per driver tick. */
+	void StartPrefabSurvey();
+	/** One step of the survey; does nothing when no survey runs. Called from the minigame driver's tick. */
+	void StepPrefabSurvey();
 }
 
 // Start Game / End Game. The game's server-side minigame flow is missing from this executable: after Start the island's minigame stops in

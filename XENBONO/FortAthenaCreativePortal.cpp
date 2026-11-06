@@ -10,6 +10,7 @@
 #include "KismetStringLibrary.h"
 #include "BuildingSMActor.h"
 #include "NetDriver.h"
+#include "PrefabArchitect.h"
 #include "FortPlayerStateAthena.h"
 #include <algorithm>
 #include <map>
@@ -2001,14 +2002,14 @@ static UClass* FindPieceClass(const char* ShortName, const wchar_t* Path)
 
 static bool InheritsFrom(UClass* Class, UClass* Base);
 
-static ABuildingSMActor* SpawnPiece(UClass* Class, double X, double Y, double Z, float Yaw, AFortPlayerControllerAthena* Builder, int Team)
+static ABuildingSMActor* SpawnPiece(UClass* Class, double X, double Y, double Z, float Yaw, AFortPlayerControllerAthena* Builder, int Team, double ScaleX = 1.0, double ScaleY = 1.0, double ScaleZ = 1.0)
 {
 	FTransform Transform{};
 	FRotator Rotation{};
 	Rotation.Yaw = Yaw;
 	Transform.Translation = FVector((float)X, (float)Y, (float)Z);
 	Transform.Rotation = Rotation.Quaternion();
-	Transform.Scale3D = { 1, 1, 1 };
+	Transform.Scale3D = { (float)ScaleX, (float)ScaleY, (float)ScaleZ };
 
 	auto Piece = GetWorld()->SpawnActor<ABuildingSMActor>(Class, Transform);
 
@@ -2114,64 +2115,23 @@ static std::vector<ClassCount> ReadClassCounts(UObject* Playset)
 	return Result;
 }
 
-enum class PieceKind { Floor, Roof, Stairs, Door, Window, Opening, Wall, Pillar, Trim, WallDecor, Prop };
-
-static const char* KindName(PieceKind Kind)
-{
-	static const char* Names[] = { "floor", "roof", "stairs", "door", "window", "opening", "wall", "pillar", "trim", "wall decoration", "decoration" };
-	return Names[(int)Kind];
-}
-
-static PieceKind KindOf(const std::string& Path)
-{
-	const auto Name = Path.substr(Path.find_last_of('/') + 1);
-	auto Has = [&](const char* Word) { return ContainsNoCase(Name, Word); };
-
-	if (Has("stair") || Has("ramp"))
-		return PieceKind::Stairs;
-
-	if (Has("roof") || Has("ceiling"))
-		return PieceKind::Roof;
-
-	if (Has("floor") || Has("ground") || Has("slab") || Has("deck"))
-		return PieceKind::Floor;
-
-	if (Has("window"))
-		return PieceKind::Window;
-
-	if (Has("doorway") || Has("arch") || Has("opening") || Has("gate"))
-		return PieceKind::Opening;
-
-	if (Has("door"))
-		return PieceKind::Door;
-
-	if (Has("pillar") || Has("column") || Has("post") || Has("pole"))
-		return PieceKind::Pillar;
-
-	if (Has("wall_light") || Has("wallart") || Has("wall_art") || Has("painting") || Has("poster") || Has("sign") || Has("banner"))
-		return PieceKind::WallDecor;
-
-	if (Has("cap") || Has("battlement") || Has("rail") || Has("trim") || Has("balcony") || Has("fence") || Has("parapet") || Has("beam") || Has("gutter"))
-		return PieceKind::Trim;
-
-	if (Has("wall"))
-		return PieceKind::Wall;
-
-	return PieceKind::Prop;
-}
-
-// What a piece measures. The pivot of a piece is not known, but its bounding box is, so every piece is placed by the middle of its box.
+// ---------------------------------------------------------------------------------------------------------------------
+// What a piece measures and how its top is shaped. Where each piece goes is worked out in PrefabArchitect.h, which knows nothing of the game: it is
+// given the pieces as types with a box and a shape, and gives back positions. Each class is measured once (the box from the actor's bounds, the shape
+// from a grid of rays dropped on it) and remembered.
+// ---------------------------------------------------------------------------------------------------------------------
 struct PieceInfo
 {
 	UClass* Class = nullptr;
+	std::string Name;
 	int Count = 0;
-	PieceKind Kind = PieceKind::Prop;
+	Architect::Kind Kind = Architect::Kind::Prop;
 	double OffsetX = 0, OffsetY = 0, OffsetZ = 0; // the middle of the box minus the actor's location (at yaw 0)
-	double ExtentX = 256, ExtentY = 32, ExtentZ = 192; // half sizes at yaw 0
+	double ExtentX = 75, ExtentY = 75, ExtentZ = 75; // half sizes at yaw 0
 	bool bMeasured = false;
-
-	double LongSide() const { return 2.0 * (std::max)(ExtentX, ExtentY); }
-	bool LongAlongX() const { return ExtentX >= ExtentY; }
+	Architect::Shape Shape = Architect::Shape::Box;
+	int HighAxis = 0, HighSign = 0, RidgeAxis = 0;
+	bool bShaped = false; // the rays gave the shape (else it is a guess from the name)
 };
 
 static bool ActorBoundsOf(AActor* Actor, double& OriginX, double& OriginY, double& OriginZ, double& ExtentX, double& ExtentY, double& ExtentZ)
@@ -2189,33 +2149,221 @@ static bool ActorBoundsOf(AActor* Actor, double& OriginX, double& OriginY, doubl
 	return ExtentX > 1 || ExtentY > 1 || ExtentZ > 1;
 }
 
-// Spawns the piece high above the prefab, reads its box, removes it again.
+// One ray straight down against what is in the world (the measured piece, high above everything else). Gives the height it hit.
+static bool TraceDown(double X, double Y, double FromZ, double ToZ, bool bComplex, double& HitZ)
+{
+	static auto Fn = FindObject<UFunction>(L"/Script/Engine.KismetSystemLibrary.LineTraceSingle");
+	static auto Library = FindObject<UObject>(L"/Script/Engine.Default__KismetSystemLibrary");
+
+	if (!Fn || !Library)
+		return false;
+
+	static const char* Path = "/Script/Engine.KismetSystemLibrary.LineTraceSingle";
+	static const int Size = Fn->GetPropertiesSize();
+	static const int WorldOffset = FindOffsetStruct(Path, "WorldContextObject");
+	static const int StartOffset = FindOffsetStruct(Path, "Start");
+	static const int EndOffset = FindOffsetStruct(Path, "End");
+	static const int ChannelOffset = FindOffsetStruct(Path, "TraceChannel");
+	static const int ComplexOffset = FindOffsetStruct(Path, "bTraceComplex");
+	static const int IgnoreSelfOffset = FindOffsetStruct(Path, "bIgnoreSelf");
+	static const int HitOffset = FindOffsetStruct(Path, "OutHit");
+	static const int ReturnOffset = FindOffsetStruct(Path, "ReturnValue");
+	static const int LocationOffset = FindOffsetStruct("/Script/Engine.HitResult", "Location");
+
+	if (Size <= 0 || Size > 4096 || WorldOffset < 0 || StartOffset < 0 || EndOffset < 0 || ChannelOffset < 0 || ComplexOffset < 0 || IgnoreSelfOffset < 0 || HitOffset < 0 || ReturnOffset < 0 || LocationOffset < 0)
+		return false;
+
+	std::vector<uint8_t> Buffer((size_t)Size + 32, 0);
+	auto At = [&](int Offset) { return Buffer.data() + Offset; };
+
+	*(UObject**)At(WorldOffset) = GetWorld();
+	*(FVector*)At(StartOffset) = FVector((float)X, (float)Y, (float)FromZ);
+	*(FVector*)At(EndOffset) = FVector((float)X, (float)Y, (float)ToZ);
+	*At(ChannelOffset) = 0; // Visibility
+	*At(ComplexOffset) = bComplex ? 1 : 0;
+	*At(IgnoreSelfOffset) = 0;
+
+	Library->ProcessEvent(Fn, Buffer.data());
+
+	if (!*At(ReturnOffset))
+		return false;
+
+	HitZ = (double)((FVector*)At(HitOffset + LocationOffset))->Z;
+	return true;
+}
+
+// The shape of the top of a piece that was just spawned: rays are dropped on a grid over its box. A flat top is a box; one side high is a shed (a
+// single slope, stairs, the end cap of a shed roof); high in the middle is a tent (a gable roof tile, the end cap of a gable).
+static bool ProfileShape(PieceInfo& Info, double OX, double OY, double OZ)
+{
+	constexpr int N = 7;
+	const double Bottom = OZ - Info.ExtentZ, Height = 2 * Info.ExtentZ;
+	double H[N][N] = {};
+	int Hits = 0;
+
+	for (int Pass = 0; Pass < 2 && Hits == 0; ++Pass) // the detailed collision first, the simple one when that gives nothing
+	{
+		for (int iy = 0; iy < N; ++iy)
+			for (int ix = 0; ix < N; ++ix)
+			{
+				const double X = OX + ((ix + 0.5) / N * 2.0 - 1.0) * Info.ExtentX * 0.97;
+				const double Y = OY + ((iy + 0.5) / N * 2.0 - 1.0) * Info.ExtentY * 0.97;
+				double Z = 0;
+
+				if (TraceDown(X, Y, OZ + Info.ExtentZ + 120.0, Bottom - 60.0, Pass == 0, Z))
+				{
+					H[ix][iy] = (std::max)(0.0, (std::min)(Z - Bottom, Height));
+					++Hits;
+				}
+			}
+	}
+
+	if (Hits < N * N / 4)
+		return false;
+
+	double ColX[N] = {}, ColY[N] = {};
+
+	for (int ix = 0; ix < N; ++ix)
+		for (int iy = 0; iy < N; ++iy)
+		{
+			ColX[ix] += H[ix][iy] / N;
+			ColY[iy] += H[ix][iy] / N;
+		}
+
+	const double Threshold = 0.2 * Height;
+
+	// 0 flat, 1 one side high (Sign: towards the larger coordinate or not), 2 high in the middle
+	auto Analyse = [&](const double* P, int& Kind, int& Sign, double& Variation) {
+		double Lo = P[0], Hi = P[0];
+
+		for (int i = 1; i < N; ++i)
+		{
+			Lo = (std::min)(Lo, P[i]);
+			Hi = (std::max)(Hi, P[i]);
+		}
+
+		Variation = Hi - Lo;
+		const double E0 = (P[0] + P[1]) / 2, E1 = (P[N - 1] + P[N - 2]) / 2, Mid = (P[N / 2 - 1] + P[N / 2] + P[N / 2 + 1]) / 3;
+		Kind = 0;
+		Sign = 0;
+
+		if (Mid - (std::max)(E0, E1) > 0.5 * Threshold)
+			Kind = 2;
+		else if (std::fabs(E1 - E0) >= Threshold)
+		{
+			Kind = 1;
+			Sign = E1 > E0 ? 1 : -1;
+		}
+	};
+
+	int KindX, SignX, KindY, SignY;
+	double VariationX, VariationY;
+	Analyse(ColX, KindX, SignX, VariationX);
+	Analyse(ColY, KindY, SignY, VariationY);
+
+	Info.Shape = Architect::Shape::Box;
+	Info.bShaped = true;
+
+	if (KindX == 0 && KindY == 0)
+		return true;
+
+	const bool bUseX = KindX != 0 && (KindY == 0 || VariationX >= VariationY);
+	const int Axis = bUseX ? 0 : 1;
+	const int Kind = bUseX ? KindX : KindY;
+	const int Sign = bUseX ? SignX : SignY;
+
+	if (Kind == 1)
+	{
+		Info.Shape = Architect::Shape::Shed;
+		Info.HighAxis = Axis;
+		Info.HighSign = Sign;
+	}
+	else
+	{
+		Info.Shape = Architect::Shape::Tent;
+		Info.RidgeAxis = 1 - Axis;
+	}
+
+	return true;
+}
+
+static std::map<UClass*, PieceInfo> MeasuredPieces;
+
+// The box and the shape of a piece: spawned high above the prefab, measured, removed again. Once per class.
 static void MeasurePiece(PieceInfo& Info, const FVector& Probe)
 {
+	if (auto It = MeasuredPieces.find(Info.Class); It != MeasuredPieces.end())
+	{
+		const auto& Known = It->second;
+		Info.OffsetX = Known.OffsetX; Info.OffsetY = Known.OffsetY; Info.OffsetZ = Known.OffsetZ;
+		Info.ExtentX = Known.ExtentX; Info.ExtentY = Known.ExtentY; Info.ExtentZ = Known.ExtentZ;
+		Info.bMeasured = Known.bMeasured;
+		Info.Shape = Known.Shape; Info.HighAxis = Known.HighAxis; Info.HighSign = Known.HighSign; Info.RidgeAxis = Known.RidgeAxis; Info.bShaped = Known.bShaped;
+		return;
+	}
+
+	// when nothing can be measured, a piece is about as big as its kind usually is
+	switch (Info.Kind)
+	{
+	case Architect::Kind::Wall: case Architect::Kind::Window: case Architect::Kind::Opening: case Architect::Kind::Door: Info.ExtentX = 256; Info.ExtentY = 32; Info.ExtentZ = 192; break;
+	case Architect::Kind::Floor: Info.ExtentX = 256; Info.ExtentY = 256; Info.ExtentZ = 16; break;
+	case Architect::Kind::Roof: Info.ExtentX = 256; Info.ExtentY = 324; Info.ExtentZ = 220; break;
+	case Architect::Kind::RoofCap: Info.ExtentX = 319; Info.ExtentY = 75; Info.ExtentZ = 220; break;
+	case Architect::Kind::Stairs: Info.ExtentX = 128; Info.ExtentY = 256; Info.ExtentZ = 192; break;
+	case Architect::Kind::Pillar: Info.ExtentX = 40; Info.ExtentY = 40; Info.ExtentZ = 192; break;
+	case Architect::Kind::Rail: Info.ExtentX = 256; Info.ExtentY = 16; Info.ExtentZ = 56; break;
+	case Architect::Kind::Feature: Info.ExtentX = 100; Info.ExtentY = 100; Info.ExtentZ = 200; break;
+	default: Info.ExtentX = 75; Info.ExtentY = 75; Info.ExtentZ = 75; break;
+	}
+
 	FTransform Transform{};
 	Transform.Translation = Probe;
 	Transform.Scale3D = { 1, 1, 1 };
 
 	auto Actor = GetWorld()->SpawnActor<AActor>(Info.Class, Transform);
 
-	if (!Actor)
-		return;
-
-	double OX, OY, OZ, EX, EY, EZ;
-
-	if (ActorBoundsOf(Actor, OX, OY, OZ, EX, EY, EZ))
+	if (Actor)
 	{
-		Info.OffsetX = OX - (double)Probe.X;
-		Info.OffsetY = OY - (double)Probe.Y;
-		Info.OffsetZ = OZ - (double)Probe.Z;
-		Info.ExtentX = EX; Info.ExtentY = EY; Info.ExtentZ = EZ;
-		Info.bMeasured = true;
+		double OX, OY, OZ, EX, EY, EZ;
+
+		if (ActorBoundsOf(Actor, OX, OY, OZ, EX, EY, EZ))
+		{
+			Info.OffsetX = OX - (double)Probe.X;
+			Info.OffsetY = OY - (double)Probe.Y;
+			Info.OffsetZ = OZ - (double)Probe.Z;
+			Info.ExtentX = EX; Info.ExtentY = EY; Info.ExtentZ = EZ;
+			Info.bMeasured = true;
+
+			// the top matters for roofs, their caps and stairs
+			if (Info.Kind == Architect::Kind::Roof || Info.Kind == Architect::Kind::RoofCap || Info.Kind == Architect::Kind::Stairs)
+				ProfileShape(Info, OX, OY, OZ);
+		}
+
+		static auto DestroyFn = FindObject<UFunction>(L"/Script/Engine.Actor.K2_DestroyActor");
+
+		if (DestroyFn)
+			Actor->ProcessEvent(DestroyFn);
 	}
 
-	static auto DestroyFn = FindObject<UFunction>(L"/Script/Engine.Actor.K2_DestroyActor");
+	// no ray result: the shape is guessed from the name and the box
+	if (!Info.bShaped)
+	{
+		if (Info.Kind == Architect::Kind::Roof)
+		{
+			Info.Shape = Architect::Shape::Tent;
+			Info.RidgeAxis = Info.ExtentX <= Info.ExtentY ? 0 : 1; // the ridge runs along the shorter side
+		}
+		else if (Info.Kind == Architect::Kind::RoofCap)
+			Info.Shape = Architect::Shape::Tent;
+		else if (Info.Kind == Architect::Kind::Stairs)
+		{
+			Info.Shape = Architect::Shape::Shed;
+			Info.HighAxis = Info.ExtentX >= Info.ExtentY ? 0 : 1;
+			Info.HighSign = 1;
+		}
+	}
 
-	if (DestroyFn)
-		Actor->ProcessEvent(DestroyFn);
+	MeasuredPieces[Info.Class] = Info;
 }
 
 // How the placement went, for the log line of the prefab.
@@ -2239,15 +2387,17 @@ static void SetActorPlacement(AActor* Actor, double X, double Y, double Z, float
 
 // Places a piece so that the middle of its box is at (CX, CY) horizontally and its underside is at BottomZ. The position is worked out from the
 // measured box, then checked against the box the spawned actor really has and corrected: nothing depends on the pivot or the turn being understood.
-// AlongX: 1 when the piece belongs on an edge that runs along X, 0 along Y, -1 when its direction does not matter.
-static ABuildingSMActor* PlaceBox(const PieceInfo& Info, double CX, double CY, double BottomZ, float Yaw, int AlongX, AFortPlayerControllerAthena* Builder, int Team)
+// AlongX: 1 when the piece belongs on an edge that runs along X, 0 along Y, -1 when its direction does not matter. A scale stretches the piece along
+// its own axes (a roof is stretched to fit its span).
+static ABuildingSMActor* PlaceBox(const PieceInfo& Info, double CX, double CY, double BottomZ, float Yaw, int AlongX, AFortPlayerControllerAthena* Builder, int Team, double Sx = 1, double Sy = 1, double Sz = 1)
 {
 	const double Radians = (double)Yaw * 3.14159265358979 / 180.0;
 	const double Cos = std::cos(Radians), Sin = std::sin(Radians);
-	const double RotatedX = Info.OffsetX * Cos - Info.OffsetY * Sin;
-	const double RotatedY = Info.OffsetX * Sin + Info.OffsetY * Cos;
+	const double OffsetX = Info.OffsetX * Sx, OffsetY = Info.OffsetY * Sy, OffsetZ = Info.OffsetZ * Sz, ExtentZ = Info.ExtentZ * Sz;
+	const double RotatedX = OffsetX * Cos - OffsetY * Sin;
+	const double RotatedY = OffsetX * Sin + OffsetY * Cos;
 
-	auto Piece = SpawnPiece(Info.Class, CX - RotatedX, CY - RotatedY, BottomZ + Info.ExtentZ - Info.OffsetZ, Yaw, Builder, Team);
+	auto Piece = SpawnPiece(Info.Class, CX - RotatedX, CY - RotatedY, BottomZ + ExtentZ - OffsetZ, Yaw, Builder, Team, Sx, Sy, Sz);
 
 	if (!Piece)
 		return nullptr;
@@ -2291,45 +2441,20 @@ static ABuildingSMActor* PlaceBox(const PieceInfo& Info, double CX, double CY, d
 	return Piece;
 }
 
-// Returns how many pieces were built; 0 when the playset lists no pieces (the wood house is used then).
-static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
+// ---------------------------------------------------------------------------------------------------------------------
+// The pieces a playset lists (class and how many), loaded and measured. The list says what and how many, not where.
+// ---------------------------------------------------------------------------------------------------------------------
+static void LoadPieces(UObject* Playset, const FVector& Probe, std::vector<PieceInfo>& Pieces, int& Failed, int& Skipped)
 {
-	const int SizeXOffset = Playset->GetOffset("SizeX", false);
-
-	if (SizeXOffset == -1)
-		return 0;
+	Pieces.clear();
+	Failed = 0;
+	Skipped = 0;
 
 	auto Counts = ReadClassCounts(Playset);
-
-	if (Counts.empty())
-	{
-		LOG_INFO(LogCreative, "Own prefab (real pieces): {} lists no pieces", Playset->GetName());
-		return 0;
-	}
-
-	const int PropsOffset = Playset->GetOffset("AssociatedPlaysetProps", false);
-	const int Props = PropsOffset == -1 || !Readable((char*)Playset + PropsOffset, 16) ? 0 : *(int*)((char*)Playset + PropsOffset + 8);
-	int SizeX = Playset->Get<int>(SizeXOffset);
-	int SizeY = Playset->Get<int>(SizeXOffset + 4);
-
-	if (Props <= 0 && SizeX * SizeY <= 1)
-		return 0;
-
-	SizeX = (std::max)(2, (std::min)(SizeX, 14));
-	SizeY = (std::max)(2, (std::min)(SizeY, 14));
-
-	// the most used pieces first, at most 24 different classes (each is loaded when first needed)
-	std::stable_sort(Counts.begin(), Counts.end(), [](const ClassCount& A, const ClassCount& B) { return A.Count > B.Count; });
-
-	std::vector<PieceInfo> Pieces;
-	int Failed = 0;
+	static auto ClassClass = FindObject<UClass>(L"/Script/CoreUObject.Class");
 
 	for (auto& Entry : Counts)
 	{
-		if (Pieces.size() >= 24)
-			break;
-
-		static auto ClassClass = FindObject<UClass>(L"/Script/CoreUObject.Class");
 		const std::wstring Path(Entry.Path.begin(), Entry.Path.end());
 		UClass* Class = FindObject<UClass>(Path.c_str());
 
@@ -2344,23 +2469,99 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 
 		PieceInfo Info;
 		Info.Class = Class;
-		Info.Count = Entry.Count;
-		Info.Kind = KindOf(Entry.Path);
+		Info.Name = Class->GetName();
+		Info.Count = (std::min)(Entry.Count, 150);
+
+		// not something to place: volumes, starts, controllers, game modes
+		if (ContainsNoCase(Info.Name, "volume") || ContainsNoCase(Info.Name, "playerstart") || ContainsNoCase(Info.Name, "gamemode") || ContainsNoCase(Info.Name, "controller") ||
+			ContainsNoCase(Info.Name, "pawn") || ContainsNoCase(Info.Name, "gamestate"))
+		{
+			++Skipped;
+			continue;
+		}
+
+		Info.Kind = Architect::KindFromName(Info.Name);
+		MeasurePiece(Info, Probe);
 		Pieces.push_back(Info);
 	}
+}
 
-	if (Pieces.empty())
+static Architect::Request MakeRequest(UObject* Playset, const std::vector<PieceInfo>& Pieces)
+{
+	Architect::Request Request;
+	Request.Name = Playset->GetName();
+
+	const int SizeXOffset = Playset->GetOffset("SizeX", false);
+
+	if (SizeXOffset != -1)
 	{
-		LOG_WARN(LogCreative, "Own prefab (real pieces): none of the {} classes of {} could be loaded", (int)Counts.size(), Playset->GetName());
+		Request.SizeX = (std::max)(1, Playset->Get<int>(SizeXOffset));
+		Request.SizeY = (std::max)(1, Playset->Get<int>(SizeXOffset + 4));
+		Request.SizeZ = (std::max)(1, Playset->Get<int>(SizeXOffset + 8));
+	}
+
+	for (auto& P : Pieces)
+	{
+		Architect::Type Type;
+		Type.Name = P.Name;
+		Type.K = P.Kind;
+		Type.Count = P.Count;
+		Type.SX = 2 * P.ExtentX; Type.SY = 2 * P.ExtentY; Type.SZ = 2 * P.ExtentZ;
+		Type.Sh = P.Shape;
+		Type.HighAxis = P.HighAxis; Type.HighSign = P.HighSign; Type.RidgeAxis = P.RidgeAxis;
+		Type.Measured = P.bMeasured;
+		Request.Types.push_back(Type);
+	}
+
+	return Request;
+}
+
+// What the layout was given, in the form tools/PrefabPreview reads: pick the "Architect input: " lines out of the log and the prefab can be looked at
+// (and the layout changed) without the game.
+static void LogRequest(const Architect::Request& Request)
+{
+	LOG_INFO(LogCreative, "Architect input: prefab {} {} {} {}", Request.Name, Request.SizeX, Request.SizeY, Request.SizeZ);
+
+	for (auto& T : Request.Types)
+		LOG_INFO(LogCreative, "Architect input: type {} {} {} {:.0f} {:.0f} {:.0f} {} {} {} {}", T.Name, Architect::KindToken(T.K), T.Count, T.SX, T.SY, T.SZ,
+			T.Sh == Architect::Shape::Shed ? "shed" : T.Sh == Architect::Shape::Tent ? "tent" : "box", T.HighAxis, T.HighSign, T.RidgeAxis);
+}
+
+// Returns how many pieces were built; 0 when the playset lists no pieces (the wood house is used then).
+static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
+{
+	const int SizeXOffset = Playset->GetOffset("SizeX", false);
+
+	if (SizeXOffset == -1)
+		return 0;
+
+	if (ReadClassCounts(Playset).empty())
+	{
+		LOG_INFO(LogCreative, "Own prefab (real pieces): {} lists no pieces", Playset->GetName());
 		return 0;
 	}
+
+	const int PropsOffset = Playset->GetOffset("AssociatedPlaysetProps", false);
+	const int Props = PropsOffset == -1 || !Readable((char*)Playset + PropsOffset, 16) ? 0 : *(int*)((char*)Playset + PropsOffset + 8);
+	const int SizeX = Playset->Get<int>(SizeXOffset);
+	const int SizeY = Playset->Get<int>(SizeXOffset + 4);
+
+	// a device or another single thing: not a prefab
+	if (Props <= 0 && SizeX * SizeY <= 1)
+		return 0;
 
 	const auto Center = Volume->GetActorLocation();
 	const FVector Probe((float)Center.X, (float)Center.Y, (float)Center.Z + 12000.f);
 
-	for (auto& Piece : Pieces)
-		if (Piece.Kind != PieceKind::WallDecor)
-			MeasurePiece(Piece, Probe);
+	std::vector<PieceInfo> Pieces;
+	int Failed = 0, Skipped = 0;
+	LoadPieces(Playset, Probe, Pieces, Failed, Skipped);
+
+	if (Pieces.empty())
+	{
+		LOG_WARN(LogCreative, "Own prefab (real pieces): none of the classes of {} could be used ({} could not be loaded, {} are not pieces)", Playset->GetName(), Failed, Skipped);
+		return 0;
+	}
 
 	// the thrower builds the pieces (their team, the build animation)
 	static auto ControllerClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerControllerAthena");
@@ -2389,259 +2590,53 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 		if (auto State = Cast<AFortPlayerStateAthena, false>(Builder->GetPlayerState()))
 			Team = State->GetTeamIndex();
 
-	// The size of the building follows the wall panels: their length is the pitch along the edge, their height one level.
-	PieceInfo* Panel = nullptr;
-
-	for (auto& P : Pieces)
-		if ((P.Kind == PieceKind::Wall || P.Kind == PieceKind::Window || P.Kind == PieceKind::Opening) && P.bMeasured && (!Panel || P.Count > Panel->Count))
-			Panel = &P;
-
-	const double Pitch = Panel ? (std::max)(256.0, (std::min)(Panel->LongSide(), 1024.0)) : 512.0;
-	const double LevelHeight = Panel ? (std::max)(192.0, (std::min)(2.0 * Panel->ExtentZ, 1024.0)) : 384.0;
-
-	const int SlotsX = (std::max)(2, (std::min)((int)std::lround(SizeX * 512.0 / Pitch), 14));
-	const int SlotsY = (std::max)(2, (std::min)((int)std::lround(SizeY * 512.0 / Pitch), 14));
-	const double Width = SlotsX * Pitch, Depth = SlotsY * Pitch;
-	const double MinX = (double)Center.X - Width / 2.0, MinY = (double)Center.Y - Depth / 2.0;
-	const double GroundZ = (double)Center.Z;
-
-	auto Total = [&](std::initializer_list<PieceKind> Kinds) {
-		int N = 0;
-
-		for (auto& P : Pieces)
-			for (auto K : Kinds)
-				if (P.Kind == K)
-					N += P.Count;
-
-		return N;
-	};
-
-	const int PerLevel = 2 * (SlotsX + SlotsY);
-	const int PanelCount = Total({ PieceKind::Wall, PieceKind::Window, PieceKind::Opening, PieceKind::Door });
-	const int Levels = (std::max)(1, (std::min)((PanelCount + PerLevel - 1) / PerLevel, 3));
-
-	int Built = 0;
-	std::map<PieceKind, int> ByKind;
+	const auto Request = MakeRequest(Playset, Pieces);
+	LogRequest(Request);
+	const auto Plan = Architect::Plan(Request);
 
 	PlacedMoved = PlacedTurned = PlacedChecked = 0;
 	PlacedMaxShift = 0;
+	const double GroundZ = (double)Center.Z;
+	int Built = 0;
+	std::map<Architect::Kind, int> ByKind;
 
-	auto Put = [&](const PieceInfo& P, double CX, double CY, double BottomZ, float Yaw, int AlongX = -1) {
-		if (PlaceBox(P, CX, CY, BottomZ, Yaw, AlongX, Builder, Team))
+	for (auto& Item : Plan.Items)
+	{
+		if (Item.Type < 0 || Item.Type >= (int)Pieces.size())
+			continue;
+
+		const auto& Info = Pieces[Item.Type];
+
+		if (PlaceBox(Info, (double)Center.X + Item.X, (double)Center.Y + Item.Y, GroundZ + Item.Z, (float)Item.Yaw, Item.AlongX, Builder, Team, Item.ScaleX, Item.ScaleY, Item.ScaleZ))
 		{
 			++Built;
-			++ByKind[P.Kind];
-		}
-	};
-
-	// slot k of a level, going round: the south edge west to east, the east edge south to north, the north edge east to west, the west edge north to south.
-	// Gives the middle of the slot and whether the edge runs along X.
-	auto SlotAt = [&](int k, double& X, double& Y, bool& bAlongX) {
-		if (k < SlotsX) { X = MinX + (k + 0.5) * Pitch; Y = MinY; bAlongX = true; return; }
-		k -= SlotsX;
-		if (k < SlotsY) { X = MinX + Width; Y = MinY + (k + 0.5) * Pitch; bAlongX = false; return; }
-		k -= SlotsY;
-		if (k < SlotsX) { X = MinX + Width - (k + 0.5) * Pitch; Y = MinY + Depth; bAlongX = true; return; }
-		k -= SlotsX;
-		X = MinX; Y = MinY + Depth - (k + 0.5) * Pitch; bAlongX = false;
-	};
-
-	// a panel's long side has to run along its edge
-	auto YawFor = [&](const PieceInfo& P, bool bEdgeAlongX) -> float { return (P.LongAlongX() == bEdgeAlongX) ? 0.f : 90.f; };
-
-	// -- the wall panels: the door in front, then the rest spread by how many of each there are
-	std::vector<PieceInfo*> Panels;
-	std::vector<int> Remaining;
-
-	for (auto& P : Pieces)
-		if (P.Kind == PieceKind::Wall || P.Kind == PieceKind::Window || P.Kind == PieceKind::Opening || P.Kind == PieceKind::Door)
-		{
-			Panels.push_back(&P);
-			Remaining.push_back(P.Count);
-		}
-
-	auto TakeNext = [&](bool bDoorOnly) -> PieceInfo* {
-		int Best = -1;
-		double BestShare = -1;
-
-		for (size_t i = 0; i < Panels.size(); ++i)
-		{
-			const bool bDoor = Panels[i]->Kind == PieceKind::Door;
-
-			if (Remaining[i] <= 0 || bDoorOnly != bDoor)
-				continue;
-
-			const double Share = (double)Remaining[i] / Panels[i]->Count + Panels[i]->Count * 0.0001;
-
-			if (Share > BestShare)
-			{
-				BestShare = Share;
-				Best = (int)i;
-			}
-		}
-
-		if (Best < 0)
-			return nullptr;
-
-		--Remaining[Best];
-		return Panels[Best];
-	};
-
-	for (int Level = 0; Level < Levels; ++Level)
-	{
-		for (int k = 0; k < PerLevel; ++k)
-		{
-			PieceInfo* Piece = nullptr;
-
-			if (Level == 0 && k == SlotsX / 2)
-				Piece = TakeNext(true); // the door, front centre
-
-			if (!Piece)
-				Piece = TakeNext(false);
-
-			if (!Piece)
-				break;
-
-			double X, Y;
-			bool bAlongX;
-			SlotAt(k, X, Y, bAlongX);
-			Put(*Piece, X, Y, GroundZ + Level * LevelHeight, YawFor(*Piece, bAlongX), bAlongX ? 1 : 0);
-		}
-	}
-
-	// -- pillars at the corners and the middle of each edge, one per level
-	{
-		std::vector<std::pair<double, double>> Spots = { { MinX, MinY }, { MinX + Width, MinY }, { MinX + Width, MinY + Depth }, { MinX, MinY + Depth },
-			{ MinX + Width / 2, MinY }, { MinX + Width, MinY + Depth / 2 }, { MinX + Width / 2, MinY + Depth }, { MinX, MinY + Depth / 2 } };
-		int Placed = 0;
-
-		for (auto& P : Pieces)
-		{
-			if (P.Kind != PieceKind::Pillar)
-				continue;
-
-			for (int n = 0; n < P.Count && Placed < (int)Spots.size() * Levels; ++n, ++Placed)
-				Put(P, Spots[Placed % Spots.size()].first, Spots[Placed % Spots.size()].second, GroundZ + (Placed / (int)Spots.size()) * LevelHeight, 0.f);
-		}
-	}
-
-	// -- floors: the ground first, the ones left over become the upper deck
-	{
-		int Tile = 0;
-
-		for (auto& P : Pieces)
-		{
-			if (P.Kind != PieceKind::Floor)
-				continue;
-
-			const double Cell = (std::max)(128.0, (std::min)(P.LongSide(), 2048.0));
-			const int CellsX = (std::max)(1, (int)std::lround(Width / Cell)), CellsY = (std::max)(1, (int)std::lround(Depth / Cell));
-
-			for (int n = 0; n < P.Count; ++n, ++Tile)
-			{
-				const int Deck = Tile / (CellsX * CellsY);
-				const int At = Tile % (CellsX * CellsY);
-
-				if (Deck > 1)
-					break;
-
-				Put(P, MinX + (At % CellsX + 0.5) * Cell, MinY + (At / CellsX + 0.5) * Cell, GroundZ + Deck * Levels * LevelHeight, 0.f);
-			}
-		}
-	}
-
-	// -- the roof, over the walls
-	{
-		int Tile = 0;
-
-		for (auto& P : Pieces)
-		{
-			if (P.Kind != PieceKind::Roof)
-				continue;
-
-			const double Cell = (std::max)(128.0, (std::min)(P.LongSide(), 2048.0));
-			const int CellsX = (std::max)(1, (int)std::lround(Width / Cell)), CellsY = (std::max)(1, (int)std::lround(Depth / Cell));
-
-			for (int n = 0; n < P.Count && Tile < CellsX * CellsY; ++n, ++Tile)
-				Put(P, MinX + (Tile % CellsX + 0.5) * Cell, MinY + (Tile / CellsX + 0.5) * Cell, GroundZ + Levels * LevelHeight, 0.f);
-		}
-	}
-
-	// -- trim (battlements, rails, caps) along the top edge
-	{
-		int Slot = 0;
-
-		for (auto& P : Pieces)
-		{
-			if (P.Kind != PieceKind::Trim)
-				continue;
-
-			for (int n = 0; n < P.Count && Slot < PerLevel; ++n, ++Slot)
-			{
-				double X, Y;
-				bool bAlongX;
-				SlotAt(Slot, X, Y, bAlongX);
-				Put(P, X, Y, GroundZ + Levels * LevelHeight, YawFor(P, bAlongX), bAlongX ? 1 : 0);
-			}
-		}
-	}
-
-	// -- stairs inside, near the south west corner
-	{
-		int Placed = 0;
-
-		for (auto& P : Pieces)
-		{
-			if (P.Kind != PieceKind::Stairs)
-				continue;
-
-			for (int n = 0; n < P.Count && Placed < 2; ++n, ++Placed)
-				Put(P, MinX + Pitch * (1.5 + Placed * 1.5), MinY + Pitch * 1.5, GroundZ, 0.f);
-		}
-	}
-
-	// -- decoration on the ground in rows through the inside, spaced by its own size
-	{
-		double X = MinX + Pitch * 1.2, Y = MinY + Pitch * 1.2, RowHeight = 0;
-		int Placed = 0;
-
-		for (auto& P : Pieces)
-		{
-			if (P.Kind != PieceKind::Prop)
-				continue;
-
-			const double Size = (std::max)(96.0, P.LongSide()) + 48.0;
-
-			for (int n = 0; n < P.Count && Placed < 40; ++n, ++Placed)
-			{
-				if (X + Size > MinX + Width - Pitch)
-				{
-					X = MinX + Pitch * 1.2;
-					Y += RowHeight;
-					RowHeight = 0;
-				}
-
-				if (Y + Size > MinY + Depth - Pitch)
-					break;
-
-				Put(P, X + Size / 2, Y + Size / 2, GroundZ, (float)((Placed % 4) * 90));
-				X += Size;
-				RowHeight = (std::max)(RowHeight, Size);
-			}
+			++ByKind[Plan.Types.size() > (size_t)Item.Type ? Plan.Types[Item.Type].K : Info.Kind];
 		}
 	}
 
 	std::string Summary;
 
 	for (auto& Entry : ByKind)
-		Summary += std::format(" {}x{}", Entry.second, KindName(Entry.first));
+		Summary += std::format(" {}x{}", Entry.second, Architect::KindName(Entry.first));
 
-	LOG_INFO(LogCreative, "Own prefab (real pieces): built {} pieces for {} ({} x {} slots of {:.0f}, level height {:.0f}, {} levels, {} classes loaded, {} could not be loaded):{}", Built, Playset->GetName(), SlotsX, SlotsY, Pitch,
-		LevelHeight, Levels, (int)Pieces.size(), Failed, Summary);
-	LOG_INFO(LogCreative, "Own prefab (real pieces): of {} pieces whose box was checked {} had to be moved (the largest by {:.0f}) and {} turned a quarter", PlacedChecked, PlacedMoved, PlacedMaxShift, PlacedTurned);
+	if (Plan.bExhibit)
+	{
+		LOG_INFO(LogCreative, "Own prefab (exhibit): built {} of {} planned pieces for {} (a gallery of props), {} classes loaded, {} could not be loaded:{}", Built, (int)Plan.Items.size(), Playset->GetName(), (int)Pieces.size(), Failed, Summary);
+	}
+	else
+	{
+		LOG_INFO(LogCreative, "Own prefab (architect): built {} of {} planned pieces for {} ({} x {} slots of {:.0f}, {} levels of {:.0f}, {} classes loaded, {} could not be loaded):{}", Built, (int)Plan.Items.size(), Playset->GetName(), Plan.CoreX,
+			Plan.CoreY, Plan.Pitch, Plan.Levels, Plan.Step, (int)Pieces.size(), Failed, Summary);
+	}
+
+	for (auto& Note : Plan.Notes)
+		LOG_INFO(LogCreative, "  layout: {}", Note);
+
+	LOG_INFO(LogCreative, "Own prefab (architect): of {} pieces whose box was checked {} had to be moved (the largest by {:.0f}) and {} turned a quarter", PlacedChecked, PlacedMoved, PlacedMaxShift, PlacedTurned);
 
 	for (auto& P : Pieces)
-		LOG_INFO(LogCreative, "  piece {} x{} as {}: box {:.0f} x {:.0f} x {:.0f}{}", P.Class->GetName(), P.Count, KindName(P.Kind), 2 * P.ExtentX, 2 * P.ExtentY, 2 * P.ExtentZ, P.bMeasured ? "" : " (not measured)");
+		LOG_INFO(LogCreative, "  piece {} x{} as {}: box {:.0f} x {:.0f} x {:.0f}, shape {}{}", P.Name, P.Count, Architect::KindName(P.Kind), 2 * P.ExtentX, 2 * P.ExtentY, 2 * P.ExtentZ,
+			P.Shape == Architect::Shape::Shed ? "shed" : P.Shape == Architect::Shape::Tent ? "tent" : "box", P.bMeasured ? (P.bShaped ? "" : " (guessed)") : " (not measured)");
 
 	return Built;
 }
@@ -2818,6 +2813,11 @@ static UClass* FindDeviceClass(const std::string& Device)
 		return It->second;
 
 	auto Assets = RegistryAssets("/Game/Creative/Devices/" + Device, true);
+
+	// PID_CP_Devices_CreativeButton has its blueprints in .../Devices/Button
+	if (Assets.empty() && Device.rfind("Creative", 0) == 0 && Device.size() > 8)
+		Assets = RegistryAssets("/Game/Creative/Devices/" + Device.substr(8), true);
+
 	std::vector<std::string> Candidates;
 
 	for (auto& [Package, Class] : Assets)
@@ -2914,7 +2914,7 @@ static std::vector<MapActor> ReadDeviceMap(const std::string& Device)
 		bListed = true;
 
 		for (auto& Entry : RegistryAssets("/Game/Creative", true))
-			if (Entry.second == "World" && Entry.first.find("/Maps/Devices/") != std::string::npos)
+			if (Entry.second == "World" && Entry.first.find("/CP_Device") != std::string::npos)
 				DeviceMaps.push_back(Entry);
 
 		LOG_INFO(LogCreative, "Device maps: the registry lists {} maps under /Game/Creative/Maps/Devices", (int)DeviceMaps.size());
@@ -2939,12 +2939,34 @@ static std::vector<MapActor> ReadDeviceMap(const std::string& Device)
 	{
 		LOG_INFO(LogCreative, "Device map {}: {} did not load, looking in the registry's list", Device, PathText);
 
+		// lower case, no underscores, no "creative" in front: CreativeButton, Creative_Button and Button are the same name
+		auto Plain = [](std::string Text) {
+			Text = LowerText(Text);
+			Text.erase(std::remove(Text.begin(), Text.end(), '_'), Text.end());
+
+			if (Text.rfind("cpdevices", 0) == 0)
+				Text = Text.substr(9);
+			else if (Text.rfind("cpdevice", 0) == 0)
+				Text = Text.substr(8);
+
+			if (Text.rfind("creative", 0) == 0 && Text.size() > 8)
+				Text = Text.substr(8);
+
+			return Text;
+		};
+
+		const auto Wanted = Plain(Device);
+
 		for (auto& [Name, Class] : DeviceMaps)
 		{
-			const auto Short = LowerText(Name.substr(Name.find_last_of('/') + 1));
+			const auto Short = Plain(Name.substr(Name.find_last_of('/') + 1));
+			const bool bSame = Short == Wanted || (Wanted.size() >= 4 && Short.size() >= 4 && (Short.find(Wanted) != std::string::npos || Wanted.find(Short) != std::string::npos));
 
-			if (Short.find(LowerText(Device)) != std::string::npos && (World = TryLoad(Name, PathText)))
+			if (bSame && (World = TryLoad(Name, PathText)))
+			{
+				LOG_INFO(LogCreative, "Device map {}: found as {}", Device, PathText);
 				break;
+			}
 		}
 	}
 
@@ -3032,12 +3054,20 @@ static std::vector<MapActor> ReadDeviceMap(const std::string& Device)
 static int BuildOwnDevice(AFortVolume* Volume, UObject* Playset)
 {
 	const std::string Name = Playset->GetName();
-	const std::string Prefix = "PID_CP_Devices_";
 
-	if (Name.rfind(Prefix, 0) != 0)
+	// the device playsets are PID_CP_Devices_<Name>, the later ones PID_019_PC_Device_<Name>
+	std::string Device;
+
+	for (const char* Prefix : { "PID_CP_Devices_", "PID_019_PC_Device_", "PID_CP_Device_" })
+		if (Name.rfind(Prefix, 0) == 0)
+		{
+			Device = Name.substr(std::strlen(Prefix));
+			break;
+		}
+
+	if (Device.empty())
 		return 0;
 
-	const std::string Device = Name.substr(Prefix.size());
 	auto MapActors = ReadDeviceMap(Device);
 
 	UClass* Class = nullptr;
@@ -3121,6 +3151,25 @@ static int BuildOwnDevice(AFortVolume* Volume, UObject* Playset)
 
 		++Spawned;
 
+		// an actor that does not replicate is never seen by a client
+		{
+			static auto ReplicatesOffset = Spawned_->GetOffset("bReplicates", false);
+			static auto ReplicatesMask = ReplicatesOffset == -1 ? (uint8_t)0 : GetFieldMask(Spawned_->GetProperty("bReplicates"));
+			static auto SetReplicatesFn = FindObject<UFunction>(L"/Script/Engine.Actor.SetReplicates");
+
+			const bool bReplicates = ReplicatesOffset != -1 && ReplicatesMask && Spawned_->ReadBitfieldValue(ReplicatesOffset, ReplicatesMask);
+
+			if (!bReplicates && SetReplicatesFn)
+			{
+				bool bNew = true;
+				Spawned_->ProcessEvent(SetReplicatesFn, &bNew);
+				LOG_INFO(LogCreative, "Own device {}: {} did not replicate, it does now", Device, Entry.Class->GetName());
+			}
+
+			Spawned_->FlushNetDormancy();
+			Spawned_->ForceNetUpdate();
+		}
+
 		// a building actor is told who built it (team, build animation)
 		if (BuildingActorClass && InheritsFrom(Entry.Class, BuildingActorClass))
 		{
@@ -3136,6 +3185,69 @@ static int BuildOwnDevice(AFortVolume* Volume, UObject* Playset)
 
 	LOG_INFO(LogCreative, "Own device {}: {} actors spawned (builder {}, team {})", Device, Spawned, Describe(Builder), Team);
 	return Spawned;
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// A survey of every prefab: the pieces each lists, measured, written to the log as "Architect input" lines (what tools/PrefabPreview reads) and what the
+// layout makes of them in one line. One playset every tick of the driver (a quarter second) so the game keeps running.
+// ---------------------------------------------------------------------------------------------------------------------
+static std::vector<std::string> SurveyQueue;
+static size_t SurveyNext = 0;
+static bool bSurveyActive = false;
+
+void CreativeIsland::StartPrefabSurvey()
+{
+	SurveyQueue.clear();
+	SurveyNext = 0;
+
+	for (auto& Asset : RegistryAssets("/Game/Playsets", false))
+		if (Asset.second == "FortPlaysetItemDefinition")
+			SurveyQueue.push_back(Asset.first);
+
+	std::sort(SurveyQueue.begin(), SurveyQueue.end());
+	bSurveyActive = !SurveyQueue.empty();
+	LOG_INFO(LogCreative, "Prefab survey: {} playsets to describe, one every quarter second", (int)SurveyQueue.size());
+}
+
+void CreativeIsland::StepPrefabSurvey()
+{
+	if (!bSurveyActive)
+		return;
+
+	if (SurveyNext >= SurveyQueue.size())
+	{
+		bSurveyActive = false;
+		LOG_INFO(LogCreative, "Prefab survey: finished ({} playsets)", (int)SurveyQueue.size());
+		return;
+	}
+
+	const std::string Package = SurveyQueue[SurveyNext++];
+	const std::string Name = Package.substr(Package.find_last_of('/') + 1);
+	const std::string ObjectPath = Package + "." + Name;
+	const std::wstring Path(ObjectPath.begin(), ObjectPath.end());
+	static auto PlaysetClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlaysetItemDefinition");
+	UObject* Playset = FindObject<UObject>(Path.c_str());
+
+	if (!Playset)
+		Playset = SafeLoadAsset(PlaysetClass, Path.c_str());
+
+	if (!Playset)
+	{
+		LOG_WARN(LogCreative, "Prefab survey {}/{}: {} could not be loaded", (int)SurveyNext, (int)SurveyQueue.size(), Name);
+		return;
+	}
+
+	std::vector<PieceInfo> Pieces;
+	int Failed = 0, Skipped = 0;
+	LoadPieces(Playset, FVector(0.f, 0.f, 30000.f), Pieces, Failed, Skipped);
+
+	const auto Request = MakeRequest(Playset, Pieces);
+	LogRequest(Request);
+	const auto Plan = Architect::Plan(Request);
+
+	LOG_INFO(LogCreative, "Prefab survey {}/{}: {} is {} x {} x {}, {} piece classes ({} could not be loaded, {} are not pieces); the layout places {} pieces ({}, core {} x {}, {} levels)", (int)SurveyNext,
+		(int)SurveyQueue.size(), Name, Request.SizeX, Request.SizeY, Request.SizeZ, (int)Pieces.size(), Failed, Skipped, (int)Plan.Items.size(), Plan.bExhibit ? "an exhibit" : "a building", Plan.CoreX,
+		Plan.CoreY, Plan.Levels);
 }
 
 void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
@@ -4089,6 +4201,14 @@ namespace CreativeMinigame
 			Globals::bDumpCreativeDataRequested = false;
 			CreativeIsland::DumpCreativeData("button");
 		}
+
+		if (Globals::bSurveyPrefabsRequested)
+		{
+			Globals::bSurveyPrefabsRequested = false;
+			CreativeIsland::StartPrefabSurvey();
+		}
+
+		CreativeIsland::StepPrefabSurvey();
 
 		if (!Globals::bDriveMinigames)
 		{

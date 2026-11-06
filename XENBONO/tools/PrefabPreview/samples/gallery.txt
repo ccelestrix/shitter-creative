@@ -1,0 +1,2 @@
+prefab PID_019_PG_Props_S_GameplayProps 1 1 1
+type Prop_Creative_Coin_C auto 17 60 20 60 box 0 0 0
