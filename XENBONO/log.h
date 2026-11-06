@@ -200,6 +200,23 @@ namespace ForceLog
         char text[512];
         sprintf_s(text, "%s(%u) called from %s + 0x%llX (thread %lu)", What, code, path[0] ? path : "an unknown module", (unsigned long long)returnAddress - (unsigned long long)module, GetCurrentThreadId());
         Write("critical", "LogCrash", text);
+
+        // The whole call chain that led here, every frame as module + offset, so it can be seen whether the game or this DLL started the exit.
+        void* frames[24] = {};
+        const USHORT count = CaptureStackBackTrace(0, 24, frames, nullptr);
+
+        for (USHORT i = 0; i < count; ++i)
+        {
+            HMODULE frameModule = nullptr;
+            char framePath[MAX_PATH] = {};
+
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)frames[i], &frameModule) && frameModule)
+                GetModuleFileNameA(frameModule, framePath, MAX_PATH);
+
+            const char* name = framePath[0] ? strrchr(framePath, 92) : nullptr;
+            sprintf_s(text, "  frame %u: %s + 0x%llX", (unsigned)i, name ? name + 1 : (framePath[0] ? framePath : "unknown"), (unsigned long long)frames[i] - (unsigned long long)frameModule);
+            Write("critical", "LogCrash", text);
+        }
     }
 
     inline void InstallCrashLogging()
