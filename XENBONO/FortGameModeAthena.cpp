@@ -317,6 +317,7 @@ void SetupEverythingAI() // find better name lol
 // If a request was lost (no streaming level for that level exists after a while) it is made again for that level only, and a streaming level that exists
 // but does not load is asked to load.
 static ULONGLONG HubWaitingSince = 0;
+static bool bHubLoadedDirectly = false;
 
 static std::string LevelShortName(const std::string& Path)
 {
@@ -365,6 +366,31 @@ static void ReportStreamingFoundations()
 	Actors.Free();
 }
 
+// Is the asset registry still loading its assets? A level that is asked for while it is can fail to start. -1: unknown, 0: finished, 1: still loading.
+static int AssetRegistryLoading()
+{
+	auto Helpers = FindObject<UObject>(L"/Script/AssetRegistry.Default__AssetRegistryHelpers");
+	auto GetRegistryFn = Helpers ? Helpers->FindFunction("GetAssetRegistry") : nullptr;
+
+	if (!GetRegistryFn)
+		return -1;
+
+	struct { UObject* Object; void* Interface; } Registry{};
+	Helpers->ProcessEvent(GetRegistryFn, &Registry);
+
+	if (!Registry.Object)
+		return -1;
+
+	auto Fn = Registry.Object->FindFunction("IsLoadingAssets");
+
+	if (!Fn)
+		return -1;
+
+	struct { bool ReturnValue; } Result{ false };
+	Registry.Object->ProcessEvent(Fn, &Result);
+	return Result.ReturnValue ? 1 : 0;
+}
+
 // Loads a level straight away, the way a level is loaded at runtime when nothing else asks for it (ULevelStreamingDynamic::LoadLevelInstance). Named like
 // the level itself, so that the level has the name a client expects for it.
 static bool LoadLevelInstanceNow(const std::string& LevelPath)
@@ -397,7 +423,6 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 	static bool bNudged = false;
 	static int Requests = 0; // how many times the missing levels were requested again
 	static bool bEngineLogged = false;
-	static bool bLoadedDirectly = false;
 
 	const ULONGLONG Now = GetTickCount64();
 
@@ -407,9 +432,9 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 	const ULONGLONG Waited = Now - HubWaitingSince;
 	const bool bReport = Now - LastReport >= (Reports < 20 ? 4000 : 20000) && Reports < 40;
 	const bool bNudge = !bNudged && Waited >= 8000;
-	const bool bRequest = (Requests == 0 && Waited >= 10000) || (Requests == 1 && Waited >= 30000);
+	const bool bRequest = false; // asking again through more foundations did not help (and gives the clients more of them to stream)
 	const bool bEngineLog = !bEngineLogged && Waited >= 15000;
-	const bool bDirect = !bLoadedDirectly && Waited >= 20000;
+	const bool bDirect = !bHubLoadedDirectly && Waited >= 8000;
 
 	if (!bReport && !bNudge && !bRequest && !bEngineLog && !bDirect)
 		return;
@@ -548,8 +573,8 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 		if (StartCreativeClass)
 			Starts.Free();
 
-		LOG_INFO(LogCreative, "Waiting for the creative hub ({} s) in world {}: {} FortPlayerStartCreative actors, {} streaming levels, playlist levels:{}{}", (int)(Waited / 1000), World->GetName(), StartCount,
-			Levels.Num(), PlaylistSummary.empty() ? std::string(" unknown") : PlaylistSummary, Summary);
+		LOG_INFO(LogCreative, "Waiting for the creative hub ({} s) in world {}: {} FortPlayerStartCreative actors, {} streaming levels, asset registry loading {}, playlist levels:{}{}", (int)(Waited / 1000), World->GetName(), StartCount,
+			Levels.Num(), AssetRegistryLoading(), PlaylistSummary.empty() ? std::string(" unknown") : PlaylistSummary, Summary);
 
 		ReportStreamingFoundations();
 	}
@@ -557,7 +582,7 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 	// Still no streaming level for a playlist level after 20 s: the game's own way of loading it is not working this time, so it is loaded directly.
 	if (bDirect)
 	{
-		bLoadedDirectly = true;
+		bHubLoadedDirectly = true;
 
 		if (Levels.Num() == 0 || !Missing.empty())
 		{
@@ -650,6 +675,31 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 	} */
 
 	static int LastNum2 = 1;
+
+	// The playlist's levels are asked for in the presetup. If the asset registry is still scanning at that moment the request can be lost, so the
+	// presetup waits for it (at most 30 s).
+	if (IsCreativeGame() && AmountOfRestarts != LastNum2)
+	{
+		static ULONGLONG RegistryWaitStart = 0;
+		static bool bSaid = false;
+		const int Loading = AssetRegistryLoading();
+
+		if (!RegistryWaitStart)
+			RegistryWaitStart = GetTickCount64();
+
+		if (Loading == 1 && GetTickCount64() - RegistryWaitStart < 30000)
+		{
+			if (!bSaid)
+			{
+				bSaid = true;
+				LOG_INFO(LogCreative, "The asset registry is still loading, the playlist levels are asked for when it has finished");
+			}
+
+			return false;
+		}
+
+		LOG_INFO(LogCreative, "Asset registry loading state at the presetup: {} (waited {} ms for it)", Loading, (int)(GetTickCount64() - RegistryWaitStart));
+	}
 
 	if (AmountOfRestarts != LastNum2)
 	{
@@ -1060,6 +1110,26 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 		{
 			LOG_INFO(LogCreative, "The player starts exist now, the server waited {} s for them", (int)((GetTickCount64() - HubWaitingSince) / 1000));
 			HubWaitingSince = 0;
+
+			// The hub was loaded by hand: the game never saw its levels arrive. The functions it runs when a playlist level has streamed in and when all of
+			// them are visible are called now (once per level), so whatever waits for them (the volumes) starts.
+			if (bHubLoadedDirectly)
+			{
+				static auto StreamedFn = FindObject<UFunction>(L"/Script/FortniteGame.FortGameState.OnFinishedStreamingAdditionalPlaylistLevel");
+				static auto ShownFn = FindObject<UFunction>(L"/Script/FortniteGame.FortGameState.OnFinishedShowingAdditionalPlaylistLevel");
+				static auto AllVisibleFn = FindObject<UFunction>(L"/Script/FortniteGame.FortGameModeAthena.HandleAllPlaylistLevelsVisible");
+
+				for (int i = 0; i < 3; ++i)
+				{
+					if (StreamedFn) GameState->ProcessEvent(StreamedFn);
+					if (ShownFn) GameState->ProcessEvent(ShownFn);
+				}
+
+				if (AllVisibleFn) GameMode->ProcessEvent(AllVisibleFn);
+
+				LOG_INFO(LogCreative, "The hub was loaded by hand: told the game its playlist levels have streamed in ({}, {}, {})", StreamedFn ? "streamed" : "no streamed event", ShownFn ? "shown" : "no shown event",
+					AllVisibleFn ? "all visible" : "no all-visible event");
+			}
 		}
 	}
 	

@@ -454,6 +454,8 @@ static void DumpVolume(const char* Label, AFortVolume* Volume)
 	}
 }
 
+static void LogIslandStreaming(const std::string& Reason);
+
 void CreativeIsland::DumpState(const std::string& Reason, int MaxTimes)
 {
 	static std::map<std::string, int> Times;
@@ -558,6 +560,9 @@ void CreativeIsland::DumpState(const std::string& Reason, int MaxTimes)
 
 	Controllers.Free();
 	LOG_INFO(LogCreative, "======== end of creative state ========");
+
+	if (Reason.find("island set up") != std::string::npos)
+		LogIslandStreaming(Reason);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1824,6 +1829,87 @@ void CreativeIsland::DumpCreativeData(const char* Why)
 	}
 
 	LOG_INFO(LogCreative, "=== end of the creative data survey ===");
+}
+
+// What the world streams when an island is set up: every streaming level with its state, and what the island volume's stream component holds. If an
+// island is missing for a player, this says whether the level for it was ever created.
+static void LogIslandStreaming(const std::string& Reason)
+{
+	auto World = GetWorld();
+	static auto StreamingOffset = World->GetOffset("StreamingLevels", false);
+
+	if (StreamingOffset != -1)
+	{
+		auto& Levels = World->Get<TArray<UObject*>>(StreamingOffset);
+		LOG_INFO(LogCreative, "Streaming levels ({}): {}", Reason, Levels.Num());
+
+		for (int i = 0; i < Levels.Num() && i < 40; ++i)
+		{
+			auto Level = Levels.at(i);
+
+			if (!Level)
+				continue;
+
+			static auto WorldAssetOffset = Level->GetOffset("WorldAsset", false);
+			static auto FlagsOffset = Level->GetOffset("bShouldBeLoaded", false);
+			std::string Path = Level->GetName();
+
+			if (WorldAssetOffset != -1)
+			{
+				auto& Asset = Level->Get<TSoftObjectPtr<UObject>>(WorldAssetOffset);
+
+				if (Asset.IsValid())
+					Path = Asset.SoftObjectPtr.ObjectID.AssetPathName.ToString();
+			}
+
+			auto Ask = [&](const char* Function) -> int {
+				struct { bool ReturnValue; } Params{ false };
+
+				if (auto Fn = Level->FindFunction(Function))
+				{
+					Level->ProcessEvent(Fn, &Params);
+					return Params.ReturnValue ? 1 : 0;
+				}
+
+				return -1;
+			};
+
+			const int Flags = FlagsOffset == -1 ? -1 : (int)*(unsigned char*)((char*)Level + FlagsOffset);
+			LOG_INFO(LogCreative, "  {} ({}): loaded {}, visible {}, shouldBeLoaded {}, shouldBeVisible {}", Path, Level->GetName(), Ask("IsLevelLoaded"), Ask("IsLevelVisible"), Flags == -1 ? -1 : (Flags >> 4) & 1,
+				Flags == -1 ? -1 : (Flags >> 3) & 1);
+		}
+	}
+
+	static auto StreamClass = FindObject<UClass>(L"/Script/FortniteGame.PlaysetLevelStreamComponent");
+	int Dumped = 0;
+
+	for (auto Component : GetAllObjectsOfClass<UObject>(StreamClass))
+	{
+		if (Component->GetName().rfind("Default__", 0) == 0 || Component->GetName().find("GEN_VARIABLE") != std::string::npos)
+			continue;
+
+		const int PlaysetOffset = Component->GetOffset("CurrentPlayset", false);
+
+		if (PlaysetOffset == -1 || !Component->Get<UObject*>(PlaysetOffset))
+			continue;
+
+		PropDump::DumpObject("Island stream component " + Component->GetFullName(), Component, 2, 70);
+
+		if (++Dumped >= 3)
+			break;
+	}
+
+	// the volume manager must have finished starting up before a volume spawns what it holds
+	if (auto Manager = FirstVolumeManager())
+	{
+		static auto StartupOffset = Manager->GetOffset("bInSpawningStartup", false);
+		struct { bool ReturnValue; } Loading{ false };
+
+		if (auto Fn = Manager->FindFunction("AreIslandsLoading"))
+			Manager->ProcessEvent(Fn, &Loading);
+
+		LOG_INFO(LogCreative, "Volume manager ({}): AreIslandsLoading {}, bInSpawningStartup {}", Reason, Loading.ReturnValue, StartupOffset == -1 ? -1 : (int)(*(const unsigned char*)((char*)Manager + StartupOffset) & 1));
+	}
 }
 
 // A playset that was just thrown: everything it holds, its first props and their records (the first few different playsets only).
