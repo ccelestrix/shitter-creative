@@ -1,5 +1,11 @@
 #pragma once
 
+#include <windows.h>
+#include <tlhelp32.h>
+#include <set>
+#include <vector>
+#include <algorithm>
+
 #include <iostream>
 #include <format>
 
@@ -187,6 +193,111 @@ namespace ForceLog
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
+    // Every thread created in this process after the hook was installed: who started it, when, and where it runs. A thread that ends the process
+    // can then be traced back to whatever created it.
+    struct ThreadRecord
+    {
+        DWORD Id;
+        ULONGLONG Tick;
+        void* Start;
+        void* Frames[5];
+    };
+
+    inline ThreadRecord ThreadRing[256] = {};
+    inline volatile LONG ThreadRingNext = 0;
+
+    inline void NoteThread(DWORD id, void* start)
+    {
+        ThreadRecord record{};
+        record.Id = id;
+        record.Tick = GetTickCount64();
+        record.Start = start;
+        CaptureStackBackTrace(2, 5, record.Frames, nullptr);
+        ThreadRing[(unsigned)(InterlockedIncrement(&ThreadRingNext) - 1) % 256] = record;
+    }
+
+    inline std::string AddressText(void* address)
+    {
+        HMODULE module = nullptr;
+        char path[MAX_PATH] = {};
+
+        if (address && GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)address, &module) && module)
+            GetModuleFileNameA(module, path, MAX_PATH);
+
+        const char* name = path[0] ? strrchr(path, 92) : nullptr;
+        char text[MAX_PATH + 40];
+        sprintf_s(text, "%s + 0x%llX", name ? name + 1 : (path[0] ? path : "unknown"), (unsigned long long)address - (unsigned long long)module);
+        return text;
+    }
+
+    inline void LogThreads(DWORD self, int lastCount)
+    {
+        const LONG next = ThreadRingNext;
+        const ULONGLONG now = GetTickCount64();
+        char text[1024];
+
+        for (LONG back = 1; back <= (std::min)(next, (LONG)256); ++back)
+        {
+            const ThreadRecord& record = ThreadRing[(unsigned)(next - back) % 256];
+
+            if (record.Id != self && back > lastCount)
+                continue;
+
+            sprintf_s(text, "  thread %lu%s, created %llu ms ago, runs %s, created through %s | %s | %s | %s", record.Id, record.Id == self ? " (THE ONE THAT ENDED THE PROCESS)" : "", now - record.Tick,
+                AddressText(record.Start).c_str(), AddressText(record.Frames[0]).c_str(), AddressText(record.Frames[1]).c_str(), AddressText(record.Frames[2]).c_str(), AddressText(record.Frames[3]).c_str());
+            Write("critical", "LogCrash", text);
+        }
+    }
+
+    // The modules loaded in the process (names only), written when asked and compared with the first list when the process ends.
+    inline std::set<std::string>& StartupModules()
+    {
+        static std::set<std::string> names;
+        return names;
+    }
+
+    inline std::vector<std::string> CurrentModules()
+    {
+        std::vector<std::string> names;
+        HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+
+        if (snapshot == INVALID_HANDLE_VALUE)
+            return names;
+
+        MODULEENTRY32W entry{};
+        entry.dwSize = sizeof(entry);
+
+        for (BOOL ok = Module32FirstW(snapshot, &entry); ok; ok = Module32NextW(snapshot, &entry))
+        {
+            std::string name;
+
+            for (const wchar_t* c = entry.szModule; *c; ++c)
+                name += (*c < 128) ? (char)*c : '?';
+
+            names.push_back(name);
+        }
+
+        CloseHandle(snapshot);
+        return names;
+    }
+
+    inline void LogModules(const char* when)
+    {
+        auto names = CurrentModules();
+        std::string line;
+
+        for (auto& name : names)
+        {
+            StartupModules().insert(name);
+            line += name + ", ";
+        }
+
+        char text[64];
+        sprintf_s(text, "Modules (%s): %d", when, (int)names.size());
+        Write("info", "LogInit", text);
+        Write("info", "LogInit", line);
+    }
+
     // Called when the game (or something in it) ends the process, so a death with no exception still leaves a line. Says which module called
     // it and where, so it can be looked up.
     inline void LogExit(const char* What, UINT code, void* returnAddress)
@@ -217,6 +328,16 @@ namespace ForceLog
             sprintf_s(text, "  frame %u: %s + 0x%llX", (unsigned)i, name ? name + 1 : (framePath[0] ? framePath : "unknown"), (unsigned long long)frames[i] - (unsigned long long)frameModule);
             Write("critical", "LogCrash", text);
         }
+
+        LogThreads(GetCurrentThreadId(), 12);
+
+        std::string added;
+
+        for (auto& name : CurrentModules())
+            if (!StartupModules().count(name))
+                added += name + ", ";
+
+        Write("critical", "LogCrash", "  modules loaded since the first list: " + (added.empty() ? std::string("none") : added));
     }
 
     inline void InstallCrashLogging()

@@ -903,6 +903,20 @@ bool ReplicateActorHook(UActorChannel* Channel)
 
 // #define CLIENT_ONLY // only console reboot
 
+typedef LONG (NTAPI* NtCreateThreadExFn)(PHANDLE, ACCESS_MASK, PVOID, HANDLE, PVOID, PVOID, ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
+static NtCreateThreadExFn NtCreateThreadExOriginal = nullptr;
+
+// Notes every thread created in this process (who started it and when), so a thread that ends the process can be traced back.
+static LONG NTAPI NtCreateThreadExHook(PHANDLE Thread, ACCESS_MASK Access, PVOID Attributes, HANDLE Process, PVOID Start, PVOID Argument, ULONG Flags, SIZE_T ZeroBits, SIZE_T StackSize, SIZE_T MaxStackSize, PVOID List)
+{
+    const LONG Status = NtCreateThreadExOriginal(Thread, Access, Attributes, Process, Start, Argument, Flags, ZeroBits, StackSize, MaxStackSize, List);
+
+    if (Status >= 0 && Thread && *Thread && (Process == GetCurrentProcess() || GetProcessId(Process) == GetCurrentProcessId()))
+        ForceLog::NoteThread(GetThreadId(*Thread), Start);
+
+    return Status;
+}
+
 static BOOL (WINAPI* TerminateProcessOriginal)(HANDLE, UINT) = nullptr;
 static VOID (WINAPI* ExitProcessOriginal)(UINT) = nullptr;
 
@@ -930,6 +944,15 @@ DWORD WINAPI Main(LPVOID)
     std::ios_base::sync_with_stdio(false);
 
     auto MH_InitCode = MH_Initialize();
+
+    // Threads created from here on are written down; the module list is the baseline for the one written when the process ends.
+    {
+        ForceLog::LogModules("at startup");
+
+        if (auto Nt = GetModuleHandleW(L"ntdll.dll"))
+            if (auto Create = GetProcAddress(Nt, "NtCreateThreadEx"))
+                Hooking::MinHook::Hook((PVOID)Create, NtCreateThreadExHook, (PVOID*)&NtCreateThreadExOriginal);
+    }
     
     if (MH_InitCode != MH_OK)
     {
