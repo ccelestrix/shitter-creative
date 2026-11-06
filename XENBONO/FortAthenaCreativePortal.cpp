@@ -7,6 +7,8 @@
 #include "FortInventory.h"
 #include "hooking.h"
 #include "GameplayStatics.h"
+#include "KismetStringLibrary.h"
+#include <algorithm>
 #include <map>
 #include <set>
 
@@ -1414,6 +1416,160 @@ static int ArrayCountOf(UObject* Object, const char* Property)
 	return Offset == -1 || !Readable((char*)Object + Offset, 16) ? -1 : *(int*)((char*)Object + Offset + 8);
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// The cooked asset registry: lists the assets of the build whether they are loaded or not, so it shows which content exists for the playsets
+// ---------------------------------------------------------------------------------------------------------------------
+static bool SafeProcessEvent(UObject* Object, UFunction* Function, void* Params)
+{
+	__try
+	{
+		Object->ProcessEvent(Function, Params);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+}
+
+static bool ContainsNoCase(const std::string& Text, const char* Word)
+{
+	std::string A = Text, B = Word;
+	std::transform(A.begin(), A.end(), A.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+	std::transform(B.begin(), B.end(), B.begin(), [](unsigned char c) { return (char)std::tolower(c); });
+	return A.find(B) != std::string::npos;
+}
+
+static std::string WideText(const wchar_t* Chars, int Count)
+{
+	std::string Text;
+
+	if (Chars && Count > 1 && Count < 4096 && Readable(Chars, (size_t)Count * 2))
+		for (int i = 0; i < Count - 1; ++i)
+			Text += (Chars[i] >= 32 && Chars[i] < 127) ? (char)Chars[i] : '?';
+
+	return Text;
+}
+
+static void SurveyAssetRegistry()
+{
+	auto Helpers = FindObject<UObject>(L"/Script/AssetRegistry.Default__AssetRegistryHelpers");
+	auto GetRegistryFn = Helpers ? Helpers->FindFunction("GetAssetRegistry") : nullptr;
+
+	if (!GetRegistryFn)
+	{
+		LOG_WARN(LogCreative, "Asset registry: AssetRegistryHelpers.GetAssetRegistry was not found");
+		return;
+	}
+
+	struct { UObject* Object; void* Interface; } Registry{};
+
+	if (!SafeProcessEvent(Helpers, GetRegistryFn, &Registry) || !PropDump::IsLiveObject(Registry.Object))
+	{
+		LOG_WARN(LogCreative, "Asset registry: no registry object came back ({})", (const void*)Registry.Object);
+		return;
+	}
+
+	LOG_INFO(LogCreative, "Asset registry: {}", Registry.Object->GetFullName());
+
+	auto ByPathFn = FindObject<UFunction>(L"/Script/AssetRegistry.AssetRegistry.GetAssetsByPath");
+	auto ByClassFn = FindObject<UFunction>(L"/Script/AssetRegistry.AssetRegistry.GetAssetsByClass");
+	auto PathsFn = FindObject<UFunction>(L"/Script/AssetRegistry.AssetRegistry.GetAllCachedPaths");
+
+	// The package paths that look like creative content.
+	if (PathsFn)
+	{
+		struct { TArray<FString> OutPathList; } Params{};
+
+		if (SafeProcessEvent(Registry.Object, PathsFn, &Params))
+		{
+			const int Total = Params.OutPathList.Num();
+			int Shown = 0;
+
+			LOG_INFO(LogCreative, "Asset registry: {} package paths are known", Total);
+
+			for (int i = 0; i < Total && Shown < 160; ++i)
+			{
+				auto& Path = Params.OutPathList.at(i);
+				const std::string Text = WideText(*(const wchar_t**)&Path, *(const int*)((const char*)&Path + 8));
+
+				if (ContainsNoCase(Text, "playset") || ContainsNoCase(Text, "creative") || ContainsNoCase(Text, "prefab") || ContainsNoCase(Text, "gallery") || ContainsNoCase(Text, "devices"))
+				{
+					LOG_INFO(LogCreative, "Asset registry path: {}", Text);
+					++Shown;
+				}
+			}
+		}
+		else
+			LOG_WARN(LogCreative, "Asset registry: GetAllCachedPaths failed");
+	}
+
+	// What an asset list holds: a count per class, and the assets that matter for the playsets.
+	auto Summarize = [&](const std::string& Label, TArray<char>& Assets, int MaxListed, bool bOnlyWorldsAndNames) {
+		const int Num = Assets.Num();
+		std::map<std::string, int> ByClass;
+		int Shown = 0;
+
+		for (int i = 0; i < Num; ++i)
+		{
+			const char* Asset = (const char*)Assets.GetData() + (size_t)i * 0x50;
+
+			if (!Readable(Asset, 0x50))
+				break;
+
+			const std::string Class = NameAt(Asset + 0x20);
+			const std::string Package = NameAt(Asset + 0x08);
+			++ByClass[Class];
+
+			const bool bInteresting = !bOnlyWorldsAndNames || Class == "World" || ContainsNoCase(Package, "barn") || ContainsNoCase(Package, "barrel") || ContainsNoCase(Package, "creatureplacer");
+
+			if (bInteresting && Shown < MaxListed)
+			{
+				LOG_INFO(LogCreative, "Asset registry {}: {} [{}]", Label, Package, Class);
+				++Shown;
+			}
+		}
+
+		std::string Classes;
+
+		for (auto& Entry : ByClass)
+			Classes += std::format(" {}x{}", Entry.second, Entry.first);
+
+		LOG_INFO(LogCreative, "Asset registry {}: {} assets, by class:{}", Label, Num, Classes.empty() ? std::string(" none") : Classes);
+	};
+
+	if (ByPathFn)
+	{
+		for (const wchar_t* Root : { L"/Game/Playsets", L"/Game/Creative" })
+		{
+			struct { FName PackagePath; TArray<char> OutAssetData; bool bRecursive; bool bIncludeOnlyOnDiskAssets; bool ReturnValue; } Params{};
+			Params.PackagePath = UKismetStringLibrary::Conv_StringToName(Root);
+			Params.bRecursive = true;
+			Params.bIncludeOnlyOnDiskAssets = false;
+
+			if (SafeProcessEvent(Registry.Object, ByPathFn, &Params))
+				Summarize(std::string("under ") + std::string(Root, Root + wcslen(Root)), Params.OutAssetData, 80, true);
+			else
+				LOG_WARN(LogCreative, "Asset registry: GetAssetsByPath failed");
+		}
+	}
+
+	if (ByClassFn)
+	{
+		for (const wchar_t* Class : { L"FortPlaysetItemDefinition", L"FortPlaysetPropItemDefinition", L"FortPlaysetGrenadeItemDefinition", L"LevelSaveRecord" })
+		{
+			struct { FName ClassName; TArray<char> OutAssetData; bool bSearchSubClasses; bool ReturnValue; } Params{};
+			Params.ClassName = UKismetStringLibrary::Conv_StringToName(Class);
+			Params.bSearchSubClasses = false;
+
+			if (SafeProcessEvent(Registry.Object, ByClassFn, &Params))
+				Summarize(std::string("class ") + std::string(Class, Class + wcslen(Class)), Params.OutAssetData, 40, false);
+			else
+				LOG_WARN(LogCreative, "Asset registry: GetAssetsByClass failed");
+		}
+	}
+}
+
 // Every playset, prop and record the game has loaded, summarised: which of them carry any data to spawn something from.
 void CreativeIsland::DumpCreativeData(const char* Why)
 {
@@ -1424,6 +1580,7 @@ void CreativeIsland::DumpCreativeData(const char* Why)
 
 	LOG_INFO(LogCreative, "=== Creative data survey ({}) ===", Why);
 	LogPakFiles();
+	SurveyAssetRegistry();
 
 	static auto PlaysetClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlaysetItemDefinition");
 	static auto PropClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlaysetPropItemDefinition");
@@ -1522,6 +1679,32 @@ void CreativeIsland::DumpCreativeData(const char* Why)
 		}
 
 		LOG_INFO(LogCreative, "Survey records: {} level save records are loaded", Listed);
+	}
+
+	// --- the islands' level save components (the machinery that applies a record to the world and writes one from it)
+	{
+		static auto SaveClass = FindObject<UClass>(L"/Script/FortniteGame.LevelSaveBaseComponent");
+		static auto SpawnerClass = FindObject<UClass>(L"/Script/FortniteGame.LevelRecordSpawner");
+		auto Components = GetAllObjectsOfClass<UObject>(SaveClass);
+		int Listed = 0;
+
+		for (auto Component : Components)
+		{
+			if (Component->GetName().rfind("Default__", 0) == 0)
+				continue;
+
+			const int RecordOffset = Component->GetOffset("LevelRecord", false);
+			UObject* Record = RecordOffset == -1 ? nullptr : Component->Get<UObject*>(RecordOffset);
+			LOG_INFO(LogCreative, "Survey level save component {}: record {}", Component->GetFullName(), Describe(Record));
+
+			if (Record && Listed++ < 3)
+			{
+				DescribeRecord("Survey level save component record", Record);
+				PropDump::DumpObject("Survey level save component record dump", Record, 2, 120);
+			}
+		}
+
+		LOG_INFO(LogCreative, "Survey level save components: {}; record spawners alive: {}", (int)Components.size(), (int)GetAllObjectsOfClass<UObject>(SpawnerClass).size());
 	}
 
 	LOG_INFO(LogCreative, "=== end of the creative data survey ===");
