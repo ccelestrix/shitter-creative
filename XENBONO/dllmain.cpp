@@ -1907,6 +1907,7 @@ DWORD WINAPI Main(LPVOID)
         LOG_INFO(LogCreative, "Creative ProcessEvent logging: {}", bProcessEventHooked ? "on" : "FAILED to hook");
     }
 
+    Globals::bInitializationFinished = true;
     LOG_INFO(LogHook, "Finished initialization!");
 
     if (false)

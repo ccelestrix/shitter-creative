@@ -35,6 +35,7 @@ namespace Globals
 	extern inline bool bShouldUseReplicationGraph = false;
 
 	extern inline bool bHitReadyToStartMatch = false;
+	extern inline volatile bool bInitializationFinished = false; // the DLL's startup thread has installed every hook
 	extern inline bool bInitializedPlaylist = false;
 	extern inline bool bStartedListening = false;
 	extern inline bool bAutoRestart = false; // doesnt work fyi

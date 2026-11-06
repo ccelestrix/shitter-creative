@@ -739,6 +739,31 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 {
 	Globals::bHitReadyToStartMatch = true;
 
+	// The DLL's startup thread installs hooks for a good while after the game is running (about 18 s in the 16:57 run). The hub of a creative game now
+	// loads in a second, so a player could join in the middle of that, and a thread calling a function in the moment it is hooked crashed the server.
+	// The game is not ready until the startup is done (at most 90 s, so a startup that fails does not hold it for ever).
+	if (IsCreativeGame() && !Globals::bInitializationFinished)
+	{
+		static ULONGLONG FirstSeen = GetTickCount64();
+		static ULONGLONG LastSaid = 0;
+		const ULONGLONG Now = GetTickCount64();
+
+		if (Now - FirstSeen < 90000)
+		{
+			if (Now - LastSaid >= 4000)
+			{
+				LastSaid = Now;
+				LOG_INFO(LogCreative, "Not ready to start: the startup is still installing hooks ({} s so far)", (int)((Now - FirstSeen) / 1000));
+			}
+
+			return false;
+		}
+
+		LOG_WARN(LogCreative, "The startup did not finish in 90 s, the game is made ready anyway");
+		Globals::bInitializationFinished = true;
+	}
+
+
 	auto GameState = GameMode->GetGameStateAthena();
 
 	auto SetPlaylist = [&GameState, &GameMode](UObject* Playlist, bool bOnRep) -> void {

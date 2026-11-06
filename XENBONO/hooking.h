@@ -278,12 +278,17 @@ namespace Hooking
 		static bool Hook(void* Addr, void* Detour, void** Original = nullptr, std::string OptionalName = "Undefined")
 		{
             LOG_INFO(LogDev, "Hooking 0x{:x}", __int64(Addr) - __int64(GetModuleHandleW(0)));
-            void* Og;
+            void* Og = nullptr;
 			auto ret1 = MH_CreateHook(Addr, Detour, &Og);
-			auto ret2 = MH_EnableHook(Addr);
 
-            if (Original)
+            // The pointer to the original has to be set BEFORE the hook is live: a thread that calls the function the moment it is patched runs the
+            // detour, which calls the original through this pointer. It used to be set after MH_EnableHook, and in that gap the call went to address 0
+            // (the crash 0.2 s after a player joined while the startup was still installing hooks).
+            if (Original && ret1 == MH_OK)
                 *Original = Og;
+
+			auto ret2 = ret1 == MH_OK ? MH_EnableHook(Addr) : ret1;
+
 
             bool wasHookSuccessful = ret1 == MH_OK && ret2 == MH_OK;
 
