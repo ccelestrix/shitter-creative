@@ -2127,15 +2127,77 @@ static void MeasurePiece(PieceInfo& Info, const FVector& Probe)
 		Actor->ProcessEvent(DestroyFn);
 }
 
-// Places a piece so that the middle of its box is at (CX, CY) horizontally and its underside is at BottomZ.
-static ABuildingSMActor* PlaceBox(const PieceInfo& Info, double CX, double CY, double BottomZ, float Yaw, AFortPlayerControllerAthena* Builder, int Team)
+// How the placement went, for the log line of the prefab.
+static int PlacedMoved = 0, PlacedTurned = 0, PlacedChecked = 0;
+static double PlacedMaxShift = 0;
+
+// Moves (and turns) a spawned actor, teleporting: nothing is swept or pushed.
+static void SetActorPlacement(AActor* Actor, double X, double Y, double Z, float Yaw)
+{
+	static auto Fn = FindObject<UFunction>(L"/Script/Engine.Actor.K2_SetActorLocationAndRotation");
+
+	if (!Fn)
+		return;
+
+	struct { float Location[3]; float Rotation[3]; bool bSweep; char Pad0[3]; char Hit[0x8C]; bool bTeleport; bool ReturnValue; char Pad1[2]; } Params{};
+	Params.Location[0] = (float)X; Params.Location[1] = (float)Y; Params.Location[2] = (float)Z;
+	Params.Rotation[1] = Yaw;
+	Params.bTeleport = true;
+	Actor->ProcessEvent(Fn, &Params);
+}
+
+// Places a piece so that the middle of its box is at (CX, CY) horizontally and its underside is at BottomZ. The position is worked out from the
+// measured box, then checked against the box the spawned actor really has and corrected: nothing depends on the pivot or the turn being understood.
+// AlongX: 1 when the piece belongs on an edge that runs along X, 0 along Y, -1 when its direction does not matter.
+static ABuildingSMActor* PlaceBox(const PieceInfo& Info, double CX, double CY, double BottomZ, float Yaw, int AlongX, AFortPlayerControllerAthena* Builder, int Team)
 {
 	const double Radians = (double)Yaw * 3.14159265358979 / 180.0;
 	const double Cos = std::cos(Radians), Sin = std::sin(Radians);
 	const double RotatedX = Info.OffsetX * Cos - Info.OffsetY * Sin;
 	const double RotatedY = Info.OffsetX * Sin + Info.OffsetY * Cos;
 
-	return SpawnPiece(Info.Class, CX - RotatedX, CY - RotatedY, BottomZ + Info.ExtentZ - Info.OffsetZ, Yaw, Builder, Team);
+	auto Piece = SpawnPiece(Info.Class, CX - RotatedX, CY - RotatedY, BottomZ + Info.ExtentZ - Info.OffsetZ, Yaw, Builder, Team);
+
+	if (!Piece)
+		return nullptr;
+
+	double OX, OY, OZ, EX, EY, EZ;
+
+	if (!ActorBoundsOf(Piece, OX, OY, OZ, EX, EY, EZ))
+		return Piece;
+
+	++PlacedChecked;
+	float UseYaw = Yaw;
+	bool bChanged = false;
+
+	// a panel's long side has to run along its edge: if the box says otherwise the piece is turned a quarter
+	if (AlongX >= 0 && (std::max)(EX, EY) > 1.25 * (std::min)(EX, EY) && ((EX >= EY) != (AlongX == 1)))
+	{
+		UseYaw += 90.f;
+		bChanged = true;
+		++PlacedTurned;
+		SetActorPlacement(Piece, (double)Piece->GetActorLocation().X, (double)Piece->GetActorLocation().Y, (double)Piece->GetActorLocation().Z, UseYaw);
+
+		if (!ActorBoundsOf(Piece, OX, OY, OZ, EX, EY, EZ))
+			return Piece;
+	}
+
+	// the middle of the real box has to be where it was wanted
+	const double DX = CX - OX, DY = CY - OY, DZ = (BottomZ + EZ) - OZ;
+	const double Shift = std::sqrt(DX * DX + DY * DY + DZ * DZ);
+
+	if (Shift > 2.0 || bChanged)
+	{
+		const auto Now = Piece->GetActorLocation();
+		SetActorPlacement(Piece, (double)Now.X + DX, (double)Now.Y + DY, (double)Now.Z + DZ, UseYaw);
+
+		if (Shift > 2.0)
+			++PlacedMoved;
+
+		PlacedMaxShift = (std::max)(PlacedMaxShift, Shift);
+	}
+
+	return Piece;
 }
 
 // Returns how many pieces were built; 0 when the playset lists no pieces (the wood house is used then).
@@ -2270,8 +2332,11 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 	int Built = 0;
 	std::map<PieceKind, int> ByKind;
 
-	auto Put = [&](const PieceInfo& P, double CX, double CY, double BottomZ, float Yaw) {
-		if (PlaceBox(P, CX, CY, BottomZ, Yaw, Builder, Team))
+	PlacedMoved = PlacedTurned = PlacedChecked = 0;
+	PlacedMaxShift = 0;
+
+	auto Put = [&](const PieceInfo& P, double CX, double CY, double BottomZ, float Yaw, int AlongX = -1) {
+		if (PlaceBox(P, CX, CY, BottomZ, Yaw, AlongX, Builder, Team))
 		{
 			++Built;
 			++ByKind[P.Kind];
@@ -2349,7 +2414,7 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 			double X, Y;
 			bool bAlongX;
 			SlotAt(k, X, Y, bAlongX);
-			Put(*Piece, X, Y, GroundZ + Level * LevelHeight, YawFor(*Piece, bAlongX));
+			Put(*Piece, X, Y, GroundZ + Level * LevelHeight, YawFor(*Piece, bAlongX), bAlongX ? 1 : 0);
 		}
 	}
 
@@ -2425,7 +2490,7 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 				double X, Y;
 				bool bAlongX;
 				SlotAt(Slot, X, Y, bAlongX);
-				Put(P, X, Y, GroundZ + Levels * LevelHeight, YawFor(P, bAlongX));
+				Put(P, X, Y, GroundZ + Levels * LevelHeight, YawFor(P, bAlongX), bAlongX ? 1 : 0);
 			}
 		}
 	}
@@ -2482,6 +2547,7 @@ static int BuildPrefabFromClasses(AFortVolume* Volume, UObject* Playset)
 
 	LOG_INFO(LogCreative, "Own prefab (real pieces): built {} pieces for {} ({} x {} slots of {:.0f}, level height {:.0f}, {} levels, {} classes loaded, {} could not be loaded):{}", Built, Playset->GetName(), SlotsX, SlotsY, Pitch,
 		LevelHeight, Levels, (int)Pieces.size(), Failed, Summary);
+	LOG_INFO(LogCreative, "Own prefab (real pieces): of {} pieces whose box was checked {} had to be moved (the largest by {:.0f}) and {} turned a quarter", PlacedChecked, PlacedMoved, PlacedMaxShift, PlacedTurned);
 
 	for (auto& P : Pieces)
 		LOG_INFO(LogCreative, "  piece {} x{} as {}: box {:.0f} x {:.0f} x {:.0f}{}", P.Class->GetName(), P.Count, KindName(P.Kind), 2 * P.ExtentX, 2 * P.ExtentY, 2 * P.ExtentZ, P.bMeasured ? "" : " (not measured)");
@@ -2763,34 +2829,33 @@ static std::vector<MapActor> ReadDeviceMap(const std::string& Device)
 		LOG_INFO(LogCreative, "Device maps: the registry lists {} maps under /Game/Creative/Maps/Devices", (int)DeviceMaps.size());
 	}
 
-	std::string Package;
+	// Every device's map is named like this; the registry listing is only the fallback for a map that is named otherwise.
+	auto TryLoad = [&](const std::string& Package, std::string& OutPath) -> UObject* {
+		OutPath = Package + "." + Package.substr(Package.find_last_of('/') + 1);
+		const std::wstring Path(OutPath.begin(), OutPath.end());
+		UObject* Loaded = FindObject<UObject>(Path.c_str());
 
-	for (auto& [Name, Class] : DeviceMaps)
-	{
-		const auto Short = LowerText(Name.substr(Name.find_last_of('/') + 1));
+		if (!Loaded)
+			Loaded = SafeLoadAsset(WorldClass, Path.c_str());
 
-		if (Short == "cp_devices_" + LowerText(Device))
-		{
-			Package = Name;
-			break;
-		}
+		return Loaded;
+	};
 
-		if (Package.empty() && Short.find(LowerText(Device)) != std::string::npos)
-			Package = Name;
-	}
-
-	if (Package.empty())
-	{
-		LOG_WARN(LogCreative, "Device map {}: the registry lists no map for it under /Game/Creative/Maps/Devices", Device);
-		return Result;
-	}
-
-	const std::string PathText = Package + "." + Package.substr(Package.find_last_of('/') + 1);
-	const std::wstring Path(PathText.begin(), PathText.end());
-	UObject* World = FindObject<UObject>(Path.c_str());
+	std::string PathText;
+	UObject* World = TryLoad("/Game/Creative/Maps/Devices/CP_Devices_" + Device, PathText);
 
 	if (!World)
-		World = SafeLoadAsset(WorldClass, Path.c_str());
+	{
+		LOG_INFO(LogCreative, "Device map {}: {} did not load, looking in the registry's list", Device, PathText);
+
+		for (auto& [Name, Class] : DeviceMaps)
+		{
+			const auto Short = LowerText(Name.substr(Name.find_last_of('/') + 1));
+
+			if (Short.find(LowerText(Device)) != std::string::npos && (World = TryLoad(Name, PathText)))
+				break;
+		}
+	}
 
 	LOG_INFO(LogCreative, "Device map {}: {} {}", Device, PathText, World ? "loaded" : "COULD NOT BE LOADED");
 
