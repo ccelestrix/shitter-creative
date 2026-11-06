@@ -1040,8 +1040,19 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 					if (OnFinishedStreamingAdditionalPlaylistLevelFn)
 						GameState->ProcessEvent(OnFinishedStreamingAdditionalPlaylistLevelFn);
 
-					if (HandleAllPlaylistLevelsVisibleFn)
+										if (HandleAllPlaylistLevelsVisibleFn)
 						GameState->ProcessEvent(HandleAllPlaylistLevelsVisibleFn);
+
+					// What the game state's list and the world hold now: when the list has the levels and the OnRep streamed them, the world has streaming levels already.
+					if (IsCreativeGame())
+					{
+						static auto ListOffset = GameState->GetOffset("AdditionalPlaylistLevelsStreamed", false);
+						static auto StreamingOffset = GetWorld()->GetOffset("StreamingLevels", false);
+
+						LOG_INFO(LogCreative, "The playlist levels are in the game state's replicated list ({} entries) and its OnRep ran: the world has {} streaming levels", ListOffset != -1 ? GameState->Get<TArray<char>>(ListOffset).Num() : -1,
+							StreamingOffset != -1 ? GetWorld()->Get<TArray<UObject*>>(StreamingOffset).Num() : -1);
+					}
+
 
 				}
 

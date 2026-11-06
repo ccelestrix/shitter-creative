@@ -366,31 +366,54 @@ TeamsArrayContainer* AFortGameStateAthena::GetTeamsArrayContainer()
 void AFortGameStateAthena::AddToAdditionalPlaylistLevelsStreamed(const FName& Name, bool bServerOnly)
 {
 	auto NameStr = Name.ToString();
-	auto NameWStr = std::wstring(NameStr.begin(), NameStr.end());
 
-	if (true)
+	// The other modes stream a playlist level with a BuildingFoundation (a hack that only starts a client's streaming when everything on the client
+	// happens in the right order). In Creative the game's own way is used: the level goes into the game state's replicated list
+	// (AdditionalPlaylistLevelsStreamed), the OnRep of that list (called by the caller once every level is in) streams the levels on this machine, and
+	// every client gets the same list and streams the levels from it by itself, whatever this machine's own streaming did.
+	if (!IsCreativeGame())
 	{
-		StreamLevel(Name.ToString()); // skunke bozo (I didn't test the next code too much soo)
+		StreamLevel(NameStr); // skunke bozo (I didn't test the next code too much soo)
+		return;
 	}
-	else
+
+	static auto AdditionalPlaylistLevelsStreamedOffset = this->GetOffset("AdditionalPlaylistLevelsStreamed", false);
+
+	if (AdditionalPlaylistLevelsStreamedOffset == -1)
 	{
-		static auto AdditionalPlaylistLevelsStreamedOffset = this->GetOffset("AdditionalPlaylistLevelsStreamed", false);
+		LOG_WARN(LogCreative, "The game state has no AdditionalPlaylistLevelsStreamed, so {} is streamed with a foundation", NameStr);
+		StreamLevel(NameStr);
+		return;
+	}
 
-		if (!FAdditionalLevelStreamed::GetStruct())
-		{
-			auto& AdditionalPlaylistLevelsStreamed = this->Get<TArray<FName>>(AdditionalPlaylistLevelsStreamedOffset);
-			AdditionalPlaylistLevelsStreamed.Add(Name);
-		}
-		else
-		{
-			auto& AdditionalPlaylistLevelsStreamed = this->Get<TArray<FAdditionalLevelStreamed>>(AdditionalPlaylistLevelsStreamedOffset);
-			auto NewLevelStreamed = Alloc<FAdditionalLevelStreamed>(FAdditionalLevelStreamed::GetStructSize());
-			NewLevelStreamed->GetLevelName() = Name;
-			NewLevelStreamed->IsServerOnly() = bServerOnly;
+	if (!FAdditionalLevelStreamed::GetStruct())
+	{
+		auto& AdditionalPlaylistLevelsStreamed = this->Get<TArray<FName>>(AdditionalPlaylistLevelsStreamedOffset);
+		AdditionalPlaylistLevelsStreamed.Add(Name);
+		LOG_INFO(LogCreative, "Playlist level {} added to the game state's list of names ({} in it)", NameStr, AdditionalPlaylistLevelsStreamed.Num());
+		return;
+	}
 
-			AdditionalPlaylistLevelsStreamed.AddPtr(NewLevelStreamed, FAdditionalLevelStreamed::GetStructSize());
+	auto& AdditionalPlaylistLevelsStreamed = this->Get<TArray<FAdditionalLevelStreamed>>(AdditionalPlaylistLevelsStreamedOffset);
+	const int StructSize = FAdditionalLevelStreamed::GetStructSize();
+
+	for (int i = 0; i < AdditionalPlaylistLevelsStreamed.Num(); ++i)
+	{
+		if (AdditionalPlaylistLevelsStreamed.at(i, StructSize).GetLevelName().ToString() == NameStr)
+		{
+			LOG_INFO(LogCreative, "Playlist level {} is already in the game state's list", NameStr);
+			return;
 		}
 	}
+
+	auto NewLevelStreamed = Alloc<FAdditionalLevelStreamed>(StructSize);
+	memset(NewLevelStreamed, 0, StructSize);
+	NewLevelStreamed->GetLevelName() = Name;
+	NewLevelStreamed->IsServerOnly() = bServerOnly;
+
+	AdditionalPlaylistLevelsStreamed.AddPtr(NewLevelStreamed, StructSize);
+	LOG_INFO(LogCreative, "Playlist level {} added to the game state's replicated list ({} in it, {} bytes each, server only: {}); the clients stream it from there", NameStr, AdditionalPlaylistLevelsStreamed.Num(), StructSize,
+		bServerOnly);
 }
 
 UClass* AFortGameStateAthena::StaticClass()
