@@ -453,15 +453,16 @@ namespace Architect
 			for (int n = 0; n < N; ++n)
 			{
 				const double W = T[Index].SX;
+				const double Gap = (std::max)(T[Index].SX, T[Index].SY) < 220 ? 20.0 : 80.0; // small pieces form a tight board
 
-				if (!Current.Items.empty() && Current.Width + W + 80 > Width)
+				if (!Current.Items.empty() && Current.Width + W + Gap > Width)
 				{
 					Rows.push_back(Current);
 					Current = Row();
 				}
 
 				Current.Items.push_back({ Index, W });
-				Current.Width += W + (Current.Items.size() > 1 ? 80 : 0);
+				Current.Width += W + (Current.Items.size() > 1 ? Gap : 0);
 				Current.Depth = (std::max)(Current.Depth, T[Index].SY);
 			}
 
@@ -474,7 +475,7 @@ namespace Architect
 		double TotalDepth = 0;
 
 		for (auto& Row : Rows)
-			TotalDepth += Row.Depth + 100;
+			TotalDepth += Row.Depth + ((std::max)(T[Row.Items[0].first].SX, T[Row.Items[0].first].SY) < 220 ? 20.0 : 100.0);
 
 		Y = -TotalDepth / 2;
 
@@ -484,11 +485,12 @@ namespace Architect
 
 			for (auto& Item : Row.Items)
 			{
+				const double Gap = (std::max)(T[Item.first].SX, T[Item.first].SY) < 220 ? 20.0 : 80.0;
 				Put(Item.first, X + Item.second / 2, Y + Row.Depth / 2, 0, 0);
-				X += Item.second + 80;
+				X += Item.second + Gap;
 			}
 
-			Y += Row.Depth + 100;
+			Y += Row.Depth + ((std::max)(T[Row.Items[0].first].SX, T[Row.Items[0].first].SY) < 220 ? 20.0 : 100.0);
 		}
 
 		Out.Pitch = 512;
@@ -1468,7 +1470,12 @@ namespace Architect
 				Take(Index);
 				const double Offset = (Placed % 2 == 0 ? 1 : -1) * ((Placed + 1) / 2) * 1.5 * P;
 				const double AlongX = RidgeAxis == 0 ? X + Offset : X, AlongY = RidgeAxis == 0 ? Y : Y + Offset;
-				Put(Index, AlongX, AlongY, RoofTop - 30.0, 0);
+
+				// a feature wider than half the building (a church steeple on a barn) is made smaller, evenly
+				const double Across = (std::min)(A, B) * P * 0.5;
+				const double Wide = (std::max)(T[Index].SX, T[Index].SY);
+				const double Scale = Wide > Across ? (std::max)(0.35, Across / Wide) : 1.0;
+				Put(Index, AlongX, AlongY, RoofTop - 30.0 * Scale, 0, -1, Scale, Scale, Scale);
 				++Placed;
 			}
 	}
@@ -1536,11 +1543,11 @@ namespace Architect
 		}
 	}
 
-	// ---------------------------------------------------------------------------------------------------------------------
-	// Everything else: props and what was left of the other kinds, in tidy rows in the yard (front first, then the sides and the back) and inside.
+	// Everything else is decoration, and decoration does not stand in rows: each kind of prop makes piles (pieces on a spiral, every one turned its own way,
+	// small ones stacked), placed round the building one after the other, the biggest first; the small kinds also go inside. A pile never overlaps another
+	// pile or the building, and the way to the door stays clear.
 	inline void Builder::Props()
 	{
-		// only decoration goes in the yard (and the small structural pieces that found no place); a roof, a wall or a door piece that was not needed is left out
 		std::vector<int> Rest;
 		int LeftOut = 0;
 
@@ -1564,23 +1571,14 @@ namespace Architect
 		if (Rest.empty())
 			return;
 
-		// the largest first, the same kind together
+		// the largest first (the same kind together)
 		std::stable_sort(Rest.begin(), Rest.end(), [&](int X, int Y) {
 			const double AreaX = T[X].SX * T[X].SY, AreaY = T[Y].SX * T[Y].SY;
 			return AreaX * std::sqrt((double)(std::min)(T[X].Count, 30)) > AreaY * std::sqrt((double)(std::min)(T[Y].Count, 30));
 		});
 
-		struct Row { double Y = 0, Depth = 0, Width = 0; std::vector<std::pair<int, double>> Items; };
-		struct Zone { double X0, X1, Y0, Y1; std::vector<Row> Rows; double Used = 0; };
-		struct Stack { int Type; size_t Zone; size_t Row; size_t Item; int Height; };
-		std::vector<Zone> Zones;
-		std::vector<Stack> StackedAt;
-		const double Gap = 50;
-
-		// the yard: the volume's footprint round the core, or a band outside it when the core fills the volume; further rings go outwards
-		const double FrontDepth = (std::max)(MinY - VolMinY, 1.2 * P);
-		const double SideWidth = (std::max)(MinX - VolMinX, 1.0 * P);
-		const double BackDepth = (std::max)(VolMaxY - MaxY, 1.0 * P);
+		struct Circle { double X, Y, R; };
+		std::vector<Circle> Piles;
 
 		// the way to the door stays clear
 		double Clear = 1.1 * P;
@@ -1589,149 +1587,138 @@ namespace Architect
 			if (T[Placed.Type].K == Kind::Door)
 				Clear = (std::max)(Clear, T[Placed.Type].Long() / 2 + 250.0);
 
-		auto Ring = [&](int Round) {
-			const double Out_ = Round * 140.0;
-			const double Front0 = MinY - 100 - FrontDepth - Round * FrontDepth - Out_;
-			const double Front1 = Front0 + FrontDepth;
-			const double East0 = MaxX + 100 + Round * SideWidth + Out_, West1 = MinX - 100 - Round * SideWidth - Out_;
-			const double Back0 = MaxY + 100 + Round * BackDepth + Out_;
-			const double WideX0 = (std::min)(VolMinX, MinX - SideWidth) - Round * (SideWidth + 140), WideX1 = (std::max)(VolMaxX, MaxX + SideWidth) + Round * (SideWidth + 140);
-
-			Zones.push_back({ WideX0, -Clear, Front0, Front1 });
-			Zones.push_back({ Clear, WideX1, Front0, Front1 });
-			Zones.push_back({ East0, East0 + SideWidth, MinY, MaxY });
-			Zones.push_back({ West1 - SideWidth, West1, MinY, MaxY });
-			Zones.push_back({ WideX0, WideX1, Back0, Back0 + BackDepth });
+		auto Hash = [](unsigned Value) {
+			Value ^= Value >> 16; Value *= 0x7feb352dU; Value ^= Value >> 15; Value *= 0x846ca68bU; Value ^= Value >> 16;
+			return Value;
 		};
 
-		Ring(0);
-
-		// inside: the aisle between the arcades, else everything inside the walls
-		if (A >= 2 && B >= 2)
-		{
-			if (PartitionPieces > 0)
+		// does a circle fit at (X, Y): clear of the building, the door path and the other piles
+		auto Fits = [&](double X, double Y, double Radius, bool bInside) {
+			if (bInside)
 			{
-				const double Half = 0.38 * P;
-
-				if (A > B)
-					Zones.push_back({ MinX + 0.6 * P, MaxX - 0.6 * P, -Half, Half });
-				else
-					Zones.push_back({ -Half, Half, MinY + 0.6 * P, MaxY - 0.6 * P });
+				if (X - Radius < MinX + 0.35 * P || X + Radius > MaxX - 0.35 * P || Y - Radius < MinY + 0.35 * P || Y + Radius > MaxY - 0.35 * P)
+					return false;
 			}
 			else
-				Zones.push_back({ MinX + 0.7 * P, MaxX - 0.7 * P, MinY + 0.6 * P, MaxY - 0.6 * P });
-		}
-
-		Ring(1);
-		Ring(2);
-
-		auto TryAdd = [&](Zone& Z, int Index, double W, double D) -> bool {
-			const double ZoneWidth = Z.X1 - Z.X0, ZoneDepth = Z.Y1 - Z.Y0;
-
-			if (W > ZoneWidth || D > ZoneDepth)
-				return false;
-
-			if (!Z.Rows.empty())
 			{
-				auto& Last = Z.Rows.back();
+				// outside the walls, with a margin
+				const double Margin = Radius + 120.0;
 
-				if (Last.Width + Gap + W <= ZoneWidth && (std::max)(Last.Depth, D) + Last.Y <= ZoneDepth)
-				{
-					Last.Items.push_back({ Index, W });
-					Last.Width += Gap + W;
-					Last.Depth = (std::max)(Last.Depth, D);
-					Z.Used = Last.Y + Last.Depth;
-					return true;
-				}
+				if (X > MinX - Margin && X < MaxX + Margin && Y > MinY - Margin && Y < MaxY + Margin)
+					return false;
+
+				// not in the path to the front door
+				if (std::fabs(X) < Clear + Radius && Y < MinY + 80 && Y > MinY - 3.2 * P - Radius)
+					return false;
 			}
 
-			const double Y = Z.Rows.empty() ? 0.0 : Z.Used + Gap;
+			for (auto& Pile : Piles)
+			{
+				const double Dx = X - Pile.X, Dy = Y - Pile.Y, Reach = Radius + Pile.R + 50.0;
 
-			if (Y + D > ZoneDepth)
-				return false;
+				if (Dx * Dx + Dy * Dy < Reach * Reach)
+					return false;
+			}
 
-			Row New;
-			New.Y = Y; New.Depth = D; New.Width = W;
-			New.Items.push_back({ Index, W });
-			Z.Rows.push_back(New);
-			Z.Used = Y + D;
 			return true;
 		};
 
-		int Dropped = 0;
-		const size_t FirstOuter = Zones.size() > 11 ? 6 : Zones.size(); // the first ring and the inside come before the outer rings
-		struct Spot { int Type; size_t Zone; size_t Row; size_t Item; int Height; };
-		std::vector<Spot> Spots;
+		// candidate places round the building, starting at the front left and going clockwise, on rings that grow outwards
+		auto Outside = [&](double Radius, double& OutX, double& OutY) {
+			for (int Ring = 0; Ring < 7; ++Ring)
+			{
+				const double Gap = 160.0 + Radius + Ring * (Radius * 1.6 + 120.0);
+				const double X0 = MinX - Gap, X1 = MaxX + Gap, Y0 = MinY - Gap, Y1 = MaxY + Gap;
+				const double Step = (std::max)(160.0, Radius * 0.9);
+				const double Perimeter = 2 * (X1 - X0) + 2 * (Y1 - Y0);
+
+				for (double Distance = 0; Distance < Perimeter; Distance += Step)
+				{
+					double X, Y, D = Distance;
+
+					if (D < X1 - X0) { X = X0 + D; Y = Y0; }
+					else if ((D -= X1 - X0) < Y1 - Y0) { X = X1; Y = Y0 + D; }
+					else if ((D -= Y1 - Y0) < X1 - X0) { X = X1 - D; Y = Y1; }
+					else { D -= X1 - X0; X = X0; Y = Y1 - D; }
+
+					if (Fits(X, Y, Radius, false))
+					{
+						OutX = X;
+						OutY = Y;
+						return true;
+					}
+				}
+			}
+
+			return false;
+		};
+
+		auto Inside = [&](double Radius, double& OutX, double& OutY) {
+			if (A < 2 || B < 2)
+				return false;
+
+			const double Step = (std::max)(120.0, Radius);
+
+			for (double Y = MinY + 0.35 * P + Radius; Y <= MaxY - 0.35 * P - Radius; Y += Step)
+				for (double X = MinX + 0.35 * P + Radius; X <= MaxX - 0.35 * P - Radius; X += Step)
+					if (Fits(X, Y, Radius, true))
+					{
+						OutX = X;
+						OutY = Y;
+						return true;
+					}
+
+			return false;
+		};
+
+		int Dropped = 0, Counter = 0;
 
 		for (int Index : Rest)
 		{
+			const auto& Type = T[Index];
+			const double D = (std::max)(Type.SX, Type.SY);
+			const bool bFlat = Type.SZ < 40;
+			const int Layers = bFlat ? 1 : (Type.SZ <= 110 && Left[Index] >= 12 ? 3 : (Type.SZ <= 160 && Left[Index] >= 6 ? 2 : 1));
+			const int Spots = (Left[Index] + Layers - 1) / Layers;
+			const double Spacing = 0.62 * D + 10.0;
+			const double Radius = Spacing * std::sqrt((double)Spots) + D * 0.5;
+
+			double CX = 0, CY = 0;
+			const bool bSmall = D <= 0.5 * P && Left[Index] <= 10;
+
+			bool bFound = (bSmall && Inside(Radius, CX, CY)) || Outside(Radius, CX, CY) || (!bSmall && Inside(Radius, CX, CY));
+
+			if (!bFound)
+			{
+				// the pile does not fit anywhere as one: split in two halves
+				Dropped += Left[Index];
+				Left[Index] = 0;
+				continue;
+			}
+
+			Piles.push_back({ CX, CY, Radius });
+
+			// the pieces on a spiral round the middle, every one turned its own way, the layers on top of each other
+			int K = 0;
+
 			while (Left[Index] > 0)
 			{
-				bool bPlaced = false;
+				const double Angle = K * 2.39996323; // the golden angle
+				const double Distance = Spacing * std::sqrt((double)K + 0.35) * (K == 0 ? 0.0 : 1.0);
+				const double X = CX + Distance * std::cos(Angle), Y = CY + Distance * std::sin(Angle);
+				const double Yaw = (Hash((unsigned)(Counter * 7919 + K * 104729)) % 24) * 15.0;
 
-				for (size_t z = 0; z < Zones.size() && !bPlaced; ++z)
+				for (int Layer = 0; Layer < Layers && Left[Index] > 0; ++Layer)
 				{
-					if (z >= FirstOuter && (T[Index].SZ <= 160 && T[Index].Count >= 4))
-						break; // small things stack before they spread to the outer rings
-
-					if (TryAdd(Zones[z], Index, T[Index].SX, T[Index].SY))
-					{
-						Spots.push_back({ Index, z, Zones[z].Rows.size() - 1, Zones[z].Rows.back().Items.size() - 1, 1 });
-						bPlaced = true;
-					}
+					Take(Index);
+					Put(Index, X, Y, Layer * Type.SZ, Yaw + Layer * 9.0);
 				}
 
-				if (!bPlaced && T[Index].SZ <= 160)
-				{
-					// on top of a piece of the same kind that is only one or two high
-					for (auto& S : Spots)
-						if (S.Type == Index && S.Height < 3)
-						{
-							++S.Height;
-							StackedAt.push_back({ Index, S.Zone, S.Row, S.Item, S.Height });
-							bPlaced = true;
-							break;
-						}
-				}
-
-				for (size_t z = FirstOuter; z < Zones.size() && !bPlaced; ++z)
-					if (TryAdd(Zones[z], Index, T[Index].SX, T[Index].SY))
-					{
-						Spots.push_back({ Index, z, Zones[z].Rows.size() - 1, Zones[z].Rows.back().Items.size() - 1, 1 });
-						bPlaced = true;
-					}
-
-				if (!bPlaced)
-				{
-					Dropped += Left[Index];
-					Left[Index] = 0;
-					break;
-				}
-
-				--Left[Index];
+				++K;
 			}
+
+			++Counter;
 		}
-
-		for (size_t z = 0; z < Zones.size(); ++z)
-			for (size_t r = 0; r < Zones[z].Rows.size(); ++r)
-			{
-				auto& Z = Zones[z];
-				auto& Row = Z.Rows[r];
-				double X = (Z.X0 + Z.X1) / 2 - Row.Width / 2;
-
-				for (size_t i = 0; i < Row.Items.size(); ++i)
-				{
-					auto& Item = Row.Items[i];
-					const double CenterX = X + Item.second / 2, CenterY = Z.Y0 + Row.Y + Row.Depth / 2;
-					Put(Item.first, CenterX, CenterY, 0, 0);
-
-					for (auto& Stack : StackedAt)
-						if (Stack.Zone == z && Stack.Row == r && Stack.Item == i)
-							Put(Item.first, CenterX, CenterY, (Stack.Height - 1) * T[Item.first].SZ, 0);
-
-					X += Item.second + Gap;
-				}
-			}
 
 		if (Dropped > 0)
 			Note(Fmt("%.0f pieces found no room", (double)Dropped));
