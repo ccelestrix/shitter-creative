@@ -1671,6 +1671,7 @@ DWORD WINAPI Main(LPVOID)
     LOG_INFO(LogCreative, "FortPlayerControllerAthena.ServerGiveCreativeItem: {}", FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerControllerAthena.ServerGiveCreativeItem") ? "found" : "NOT FOUND");
     LOG_INFO(LogCreative, "FortPlayerControllerAthena.ServerTeleportToPlaygroundLobbyIsland: {}", FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerControllerAthena.ServerTeleportToPlaygroundLobbyIsland") ? "found" : "NOT FOUND");
     LOG_INFO(LogCreative, "FortPlaysetItemDefinition playset spawner (LoadPlayset): {}", Addresses::LoadPlayset ? std::format("0x{:x}", Addresses::LoadPlayset - __int64(GetModuleHandleW(0))) : std::string("NOT FOUND"));
+    CreativeIsland::LogPakFiles();
 
     static auto FortMinigameDefault = FindObject(L"/Script/FortniteGame.Default__FortMinigame");
 

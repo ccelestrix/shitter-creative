@@ -109,6 +109,10 @@ namespace CreativeIsland
 	void StartActorProbe(const std::string& Label, class AActor* Anchor);
 	/** Writes the results of the actor probes that are due. Called from the minigame driver's tick. */
 	void TickProbes();
+	/** Lists the pak files next to the executable (a client has only client chunks; the creative server data may be in none of them). */
+	void LogPakFiles();
+	/** Writes which playsets, props and records the game has loaded and what data they carry. Must run on the game thread. */
+	void DumpCreativeData(const char* Why);
 }
 
 // Start Game / End Game. The game's server-side minigame flow is missing from this executable: after Start the island's minigame stops in

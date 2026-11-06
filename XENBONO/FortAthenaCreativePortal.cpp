@@ -745,6 +745,350 @@ static int FirstMapEntry(const char* Map)
 	return -1;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Generic property dump: what an object (or struct) really holds, read through the game's own reflection data, so nothing in it is a guess about
+// a layout. Every property is written with its type, offset and value. A struct that has no reflected properties (the saved-record structs are
+// written and read by native code) is written as raw bytes.
+// ---------------------------------------------------------------------------------------------------------------------
+namespace PropDump
+{
+	// FField and FProperty in UE 4.25 (the Offset_Internal of 0x4c that the startup log prints belongs to this layout)
+	constexpr int FieldClassAt = 0x08;
+	constexpr int ArrayDimAt = 0x38;
+	constexpr int ElementSizeAt = 0x3C;
+	constexpr int InnerAt = 0x78;  // StructProperty::Struct, ObjectProperty::PropertyClass, ArrayProperty::Inner, MapProperty::KeyProp, ByteProperty::Enum, EnumProperty::UnderlyingProp
+	constexpr int SecondAt = 0x80; // MapProperty::ValueProp, EnumProperty::Enum
+	constexpr int MapLayoutAt = 0x88;
+
+	struct Context
+	{
+		std::string Label;
+		int Lines = 0;
+		int MaxLines = 220;
+	};
+
+	static void Emit(Context& Ctx, int Indent, const std::string& Text)
+	{
+		if (Ctx.Lines > Ctx.MaxLines)
+			return;
+
+		if (Ctx.Lines == Ctx.MaxLines)
+		{
+			++Ctx.Lines;
+			LOG_INFO(LogCreative, "{}: ... (the rest is cut)", Ctx.Label);
+			return;
+		}
+
+		++Ctx.Lines;
+		LOG_INFO(LogCreative, "{}: {}{}", Ctx.Label, std::string(Indent * 2, ' '), Text);
+	}
+
+	static bool IsLiveObject(const void* Object)
+	{
+		if (!Object || !Readable(Object, 0x30))
+			return false;
+
+		if (ChunkedObjects)
+			return ChunkedObjects->IsValid((UObject*)Object);
+
+		if (UnchunkedObjects)
+			return UnchunkedObjects->IsValid((UObject*)Object);
+
+		return true;
+	}
+
+	static std::string ObjectText(const void* Pointer)
+	{
+		if (!Pointer)
+			return "null";
+
+		if (!IsLiveObject(Pointer))
+			return std::format("(not a live object: {})", Pointer);
+
+		return ((UObject*)Pointer)->GetFullName();
+	}
+
+	static std::string TypeOf(const void* Property)
+	{
+		auto FieldClass = *(const void* const*)((const char*)Property + FieldClassAt);
+		return Readable(FieldClass, 8) ? NameAt(FieldClass) : std::string("?");
+	}
+
+	static std::string BytesText(const unsigned char* Bytes, size_t Count)
+	{
+		std::string Text;
+
+		for (size_t i = 0; i < Count; ++i)
+			Text += std::format("{:02x} ", Bytes[i]);
+
+		return Text;
+	}
+
+	// The name of an enum value, from the enum's own table of names (the layout the rest of this project already relies on).
+	static std::string EnumName(const void* Enum, long long Value)
+	{
+		if (!IsLiveObject(Enum))
+			return "";
+
+		auto Names = (TArray<TPair<FName, int64>>*)(__int64(Enum) + sizeof(UField) + sizeof(FString));
+
+		if (!Readable(Names, sizeof(*Names)) || Names->Num() < 0 || Names->Num() > 4096 || !Readable(Names->GetData(), (size_t)Names->Num() * sizeof(TPair<FName, int64>)))
+			return "";
+
+		for (int i = 0; i < Names->Num(); ++i)
+		{
+			auto& Pair = Names->At(i);
+
+			if (Pair.Value() == Value)
+			{
+				auto Text = NameAt(&Pair.Key());
+				const auto Colons = Text.rfind("::");
+				return Colons == std::string::npos ? Text : Text.substr(Colons + 2);
+			}
+		}
+
+		return "";
+	}
+
+	static void DumpStruct(Context& Ctx, int Indent, int Depth, const void* Struct, const char* Base, int Size);
+	static void DumpValue(Context& Ctx, int Indent, int Depth, const std::string& Name, const void* Property, const char* Address);
+
+	static void DumpProperty(Context& Ctx, int Indent, int Depth, void* Property, const char* Base)
+	{
+		const std::string Name = NameAt((const char*)Property + Offsets::PropName);
+		const int Offset = *(const int*)((const char*)Property + Offsets::Offset_Internal);
+		const int Dim = *(const int*)((const char*)Property + ArrayDimAt);
+		const int Size = *(const int*)((const char*)Property + ElementSizeAt);
+
+		for (int i = 0; i < Dim && i < 4; ++i)
+			DumpValue(Ctx, Indent, Depth, std::format("{}{} @0x{:x}", Name, Dim > 1 ? std::format("[{}]", i) : std::string(), Offset + i * Size), Property, Base + Offset + (size_t)i * Size);
+	}
+
+	static void DumpValue(Context& Ctx, int Indent, int Depth, const std::string& Name, const void* Property, const char* Address)
+	{
+		const char* Prop = (const char*)Property;
+		const std::string Type = TypeOf(Property);
+		const int Size = *(const int*)(Prop + ElementSizeAt);
+
+		auto Line = [&](const std::string& Value) { Emit(Ctx, Indent, std::format("{} <{}>: {}", Name, Type, Value)); };
+
+		if (Size <= 0 || Size > 0x100000 || !Readable(Address, (size_t)Size))
+		{
+			Line("(unreadable)");
+			return;
+		}
+
+		if (Type == "BoolProperty")
+		{
+			const unsigned char ByteOffset = *(const unsigned char*)(Prop + 0x79);
+			const unsigned char FieldMask = *(const unsigned char*)(Prop + 0x7B);
+			Line((*(const unsigned char*)(Address + ByteOffset) & FieldMask) ? "true" : "false");
+		}
+		else if (Type == "ByteProperty")
+		{
+			const int Value = *(const unsigned char*)Address;
+			const auto EnumText = EnumName(*(const void* const*)(Prop + InnerAt), Value);
+			Line(EnumText.empty() ? std::to_string(Value) : std::format("{} ({})", Value, EnumText));
+		}
+		else if (Type == "EnumProperty")
+		{
+			const auto Underlying = *(const char* const*)(Prop + InnerAt);
+			const int UnderlyingSize = Underlying && Readable(Underlying, 0x40) ? *(const int*)(Underlying + ElementSizeAt) : 1;
+			const long long Value = UnderlyingSize == 8 ? *(const long long*)Address : UnderlyingSize == 4 ? *(const int*)Address : UnderlyingSize == 2 ? *(const short*)Address : *(const unsigned char*)Address;
+			const auto EnumText = EnumName(*(const void* const*)(Prop + SecondAt), Value);
+			Line(EnumText.empty() ? std::to_string(Value) : std::format("{} ({})", Value, EnumText));
+		}
+		else if (Type == "Int8Property")
+			Line(std::to_string((int)*(const signed char*)Address));
+		else if (Type == "Int16Property")
+			Line(std::to_string(*(const short*)Address));
+		else if (Type == "UInt16Property")
+			Line(std::to_string(*(const unsigned short*)Address));
+		else if (Type == "IntProperty")
+			Line(std::to_string(*(const int*)Address));
+		else if (Type == "UInt32Property")
+			Line(std::to_string(*(const unsigned*)Address));
+		else if (Type == "Int64Property")
+			Line(std::to_string(*(const long long*)Address));
+		else if (Type == "UInt64Property")
+			Line(std::to_string(*(const unsigned long long*)Address));
+		else if (Type == "FloatProperty")
+			Line(std::format("{}", *(const float*)Address));
+		else if (Type == "DoubleProperty")
+			Line(std::format("{}", *(const double*)Address));
+		else if (Type == "NameProperty")
+			Line(NameAt(Address));
+		else if (Type == "StrProperty")
+		{
+			const wchar_t* Chars = *(const wchar_t* const*)Address;
+			const int Count = *(const int*)(Address + 8);
+			std::string Text;
+
+			if (Chars && Count > 1 && Count < 4096 && Readable(Chars, (size_t)Count * 2))
+				for (int i = 0; i < Count - 1 && i < 120; ++i)
+					Text += (Chars[i] >= 32 && Chars[i] < 127) ? (char)Chars[i] : '?';
+
+			Line("\"" + Text + "\"");
+		}
+		else if (Type == "TextProperty")
+			Line("(text)");
+		else if (Type == "SoftObjectProperty" || Type == "SoftClassProperty")
+		{
+			auto& Soft = *(TSoftObjectPtr<UObject>*)Address;
+			Line(Soft.IsValid() ? Soft.SoftObjectPtr.ObjectID.AssetPathName.ToString() : std::string("not set"));
+		}
+		else if (Type == "ObjectProperty" || Type == "ClassProperty" || Type == "InterfaceProperty")
+			Line(ObjectText(*(const void* const*)Address));
+		else if (Type == "WeakObjectProperty" || Type == "LazyObjectProperty")
+			Line("weak/lazy reference: " + BytesText((const unsigned char*)Address, (size_t)(std::min)(Size, 16)));
+		else if (Type.find("DelegateProperty") != std::string::npos)
+			Line("(delegate)");
+		else if (Type == "StructProperty")
+		{
+			const void* Struct = *(const void* const*)(Prop + InnerAt);
+			const std::string StructName = IsLiveObject(Struct) ? ((UObject*)Struct)->GetName() : std::string("?");
+
+			if (StructName == "Vector" || StructName == "Rotator")
+				Line(FloatsAt(Address, 3));
+			else if (StructName == "Quat")
+				Line(FloatsAt(Address, 4));
+			else if (StructName == "Transform")
+				Line("rotation " + FloatsAt(Address, 4) + "location " + FloatsAt(Address + 0x10, 3) + "scale " + FloatsAt(Address + 0x20, 3));
+			else if (StructName == "Guid")
+				Line(BytesText((const unsigned char*)Address, 16));
+			else
+			{
+				Line("struct " + StructName + ", " + std::to_string(Size) + " bytes" + (Depth <= 0 ? " {...}" : ""));
+
+				if (Depth > 0)
+					DumpStruct(Ctx, Indent + 1, Depth - 1, Struct, Address, Size);
+			}
+		}
+		else if (Type == "ArrayProperty")
+		{
+			const char* Inner = *(const char* const*)(Prop + InnerAt);
+			const char* Data = *(const char* const*)Address;
+			const int Num = *(const int*)(Address + 8);
+
+			if (!Inner || !Readable(Inner, 0x80) || Num < 0 || Num > 10000000)
+			{
+				Line("(array with an unexpected layout)");
+				return;
+			}
+
+			const int InnerSize = *(const int*)(Inner + ElementSizeAt);
+			const std::string InnerType = TypeOf(Inner);
+			Line(std::format("{} elements of {}", Num, InnerType));
+
+			const int Bytes = (std::min)(Num, 64);
+
+			if (Num > 0 && (InnerType == "ByteProperty" || InnerType == "Int8Property") && Readable(Data, (size_t)Bytes))
+			{
+				Emit(Ctx, Indent + 1, "bytes: " + BytesText((const unsigned char*)Data, (size_t)Bytes));
+				return;
+			}
+
+			if (Depth <= 0 || InnerSize <= 0 || !Data)
+				return;
+
+			for (int i = 0; i < Num && i < 6; ++i)
+				DumpValue(Ctx, Indent + 1, Depth - 1, std::format("[{}]", i), Inner, Data + (size_t)i * InnerSize);
+		}
+		else if (Type == "MapProperty")
+		{
+			const char* KeyProp = *(const char* const*)(Prop + InnerAt);
+			const char* ValueProp = *(const char* const*)(Prop + SecondAt);
+			const int KeyOffset = *(const int*)(Prop + MapLayoutAt);
+			const int ValueOffset = *(const int*)(Prop + MapLayoutAt + 4);
+			const int Stride = *(const int*)(Prop + MapLayoutAt + 16); // the size of one entry with its hash links
+			const int Count = MapCount(Address);
+
+			Line(std::format("{} entries, key {}, value {} (key at +{}, value at +{}, {} bytes per entry; layout ints {} {} {} {} {} {})", Count, KeyProp && Readable(KeyProp, 0x80) ? TypeOf(KeyProp) : std::string("?"),
+				ValueProp && Readable(ValueProp, 0x80) ? TypeOf(ValueProp) : std::string("?"), KeyOffset, ValueOffset, Stride, *(const int*)(Prop + MapLayoutAt), *(const int*)(Prop + MapLayoutAt + 4),
+				*(const int*)(Prop + MapLayoutAt + 8), *(const int*)(Prop + MapLayoutAt + 12), *(const int*)(Prop + MapLayoutAt + 16), *(const int*)(Prop + MapLayoutAt + 20)));
+
+			if (Count <= 0 || Depth <= 0 || !KeyProp || !ValueProp || !Readable(KeyProp, 0x80) || !Readable(ValueProp, 0x80) || Stride < 8 || Stride > 0x400)
+				return;
+
+			const char* Data = *(const char* const*)Address;
+			const int Slots = *(const int*)(Address + 8);
+			const int NumBits = *(const int*)(Address + 0x28);
+			const unsigned* Flags = NumBits > 128 ? *(const unsigned* const*)(Address + 0x20) : (const unsigned*)(Address + 0x10);
+
+			if (!Data || Slots <= 0 || Slots > 10000000 || !Readable(Flags, (size_t)((Slots + 31) / 32) * 4))
+				return;
+
+			int Shown = 0;
+
+			for (int i = 0; i < Slots && Shown < 6; ++i)
+			{
+				if (!(Flags[i / 32] & (1u << (i % 32))))
+					continue;
+
+				const char* Entry = Data + (size_t)i * Stride;
+
+				if (!Readable(Entry, (size_t)Stride))
+					break;
+
+				DumpValue(Ctx, Indent + 1, Depth - 1, std::format("key[{}]", Shown), KeyProp, Entry + KeyOffset);
+				DumpValue(Ctx, Indent + 1, Depth - 1, std::format("value[{}]", Shown), ValueProp, Entry + ValueOffset);
+				++Shown;
+			}
+		}
+		else if (Type == "SetProperty")
+			Line(std::format("{} elements", MapCount(Address)));
+		else
+			Line("(" + Type + ") " + BytesText((const unsigned char*)Address, (size_t)(std::min)(Size, 24)));
+	}
+
+	static void DumpStruct(Context& Ctx, int Indent, int Depth, const void* Struct, const char* Base, int Size)
+	{
+		if (!IsLiveObject(Struct))
+		{
+			Emit(Ctx, Indent, "(no struct information)");
+			return;
+		}
+
+		bool bAny = false;
+
+		for (auto S = (const char*)Struct; S && IsLiveObject(S); S = (const char*)((UStruct*)S)->GetSuperStruct())
+		{
+			for (void* Prop = *(void**)(S + Offsets::Children); Prop && Readable(Prop, 0x80); Prop = GetNext(Prop))
+			{
+				bAny = true;
+				DumpProperty(Ctx, Indent, Depth, Prop, Base);
+			}
+		}
+
+		// Nothing reflected: the layout is only known to the native code, so show the bytes.
+		if (!bAny && Size > 0 && Readable(Base, (size_t)Size))
+		{
+			const int Shown = (std::min)(Size, 0x90);
+
+			for (int Row = 0; Row < Shown; Row += 16)
+				Emit(Ctx, Indent, std::format("raw +0x{:02x}: {}", Row, BytesText((const unsigned char*)Base + Row, (size_t)(std::min)(16, Shown - Row))));
+
+			if (Shown < Size)
+				Emit(Ctx, Indent, std::format("raw ... {} more bytes", Size - Shown));
+		}
+	}
+
+	static void DumpObject(const std::string& Label, UObject* Object, int Depth, int MaxLines)
+	{
+		if (!IsLiveObject(Object))
+		{
+			LOG_INFO(LogCreative, "{}: no object", Label);
+			return;
+		}
+
+		Context Ctx;
+		Ctx.Label = Label;
+		Ctx.MaxLines = MaxLines;
+		Emit(Ctx, 0, std::format("{} at {}", Object->GetFullName(), (const void*)Object));
+		DumpStruct(Ctx, 1, Depth, Object->ClassPrivate, (const char*)Object, 0);
+	}
+}
+
 // What a saved record (the thing a prefab's props are stored as) contains, as far as the SDK shows it, plus raw bytes of its first entries so the
 // layout of the opaque actor records can be worked out from the log.
 static void DescribeRecord(const std::string& Label, UObject* Record)
@@ -981,6 +1325,255 @@ static void ApplyPrefabRecords(UFortPlaysetItemDefinition* Playset, AFortVolume*
 	}
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// What this build really contains of the creative content (the client is not the dedicated server: its files may lack the server-only data)
+// ---------------------------------------------------------------------------------------------------------------------
+void CreativeIsland::LogPakFiles()
+{
+	char ExePath[MAX_PATH]{};
+	GetModuleFileNameA(nullptr, ExePath, MAX_PATH);
+	std::string Dir = ExePath;
+
+	for (int i = 0; i < 3; ++i) // ...\FortniteGame\Binaries\Win64\<exe> -> ...\FortniteGame
+	{
+		const auto Slash = Dir.find_last_of("\\/");
+
+		if (Slash == std::string::npos)
+			break;
+
+		Dir.resize(Slash);
+	}
+
+	const std::string Folder = Dir + "\\Content\\Paks";
+	WIN32_FIND_DATAA Find{};
+	HANDLE Handle = FindFirstFileA((Folder + "\\*").c_str(), &Find);
+
+	if (Handle == INVALID_HANDLE_VALUE)
+	{
+		LOG_WARN(LogCreative, "Pak files: {} could not be listed", Folder);
+		return;
+	}
+
+	int Count = 0;
+	unsigned long long Total = 0;
+	std::vector<std::string> Unusual;
+	std::string Row;
+	int InRow = 0;
+
+	do
+	{
+		if (Find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+			continue;
+
+		const std::string Name = Find.cFileName;
+		const unsigned long long Size = ((unsigned long long)Find.nFileSizeHigh << 32) | Find.nFileSizeLow;
+		++Count;
+		Total += Size;
+
+		if (Name.find("-WindowsClient.pak") == std::string::npos || Name.find("Server") != std::string::npos || Name.find("reative") != std::string::npos || Name.find("laysets") != std::string::npos)
+			Unusual.push_back(Name + " (" + std::to_string(Size >> 20) + " MB)");
+
+		Row += Name + " " + std::to_string(Size >> 20) + " MB, ";
+
+		if (++InRow == 5)
+		{
+			LOG_INFO(LogCreative, "Pak files: {}", Row);
+			Row.clear();
+			InRow = 0;
+		}
+	} while (FindNextFileA(Handle, &Find));
+
+	FindClose(Handle);
+
+	if (!Row.empty())
+		LOG_INFO(LogCreative, "Pak files: {}", Row);
+
+	LOG_INFO(LogCreative, "Pak files: {} files in {}, {} GB in all", Count, Folder, Total >> 30);
+
+	for (auto& Name : Unusual)
+		LOG_INFO(LogCreative, "Pak files: not an ordinary client chunk: {}", Name);
+
+	if (Unusual.empty())
+		LOG_INFO(LogCreative, "Pak files: every file is an ordinary client chunk (no server or creative chunk)");
+}
+
+static std::string SoftPathOf(UObject* Object, const char* Property)
+{
+	const int Offset = Object->GetOffset(Property, false);
+
+	if (Offset == -1)
+		return "n/a";
+
+	auto& Soft = Object->Get<TSoftObjectPtr<UObject>>(Offset);
+	return Soft.IsValid() ? Soft.SoftObjectPtr.ObjectID.AssetPathName.ToString() : std::string("-");
+}
+
+static int ArrayCountOf(UObject* Object, const char* Property)
+{
+	const int Offset = Object->GetOffset(Property, false);
+	return Offset == -1 || !Readable((char*)Object + Offset, 16) ? -1 : *(int*)((char*)Object + Offset + 8);
+}
+
+// Every playset, prop and record the game has loaded, summarised: which of them carry any data to spawn something from.
+void CreativeIsland::DumpCreativeData(const char* Why)
+{
+	static int Times = 0;
+
+	if (Times++ >= 6)
+		return;
+
+	LOG_INFO(LogCreative, "=== Creative data survey ({}) ===", Why);
+	LogPakFiles();
+
+	static auto PlaysetClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlaysetItemDefinition");
+	static auto PropClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlaysetPropItemDefinition");
+	static auto RecordClass = FindObject<UClass>(L"/Script/FortniteGame.LevelSaveRecord");
+
+	// --- playsets
+	{
+		auto Playsets = GetAllObjectsOfClass<UObject>(PlaysetClass);
+		int WithLevel = 0, WithItem = 0, WithRecord = 0, WithCollection = 0, WithProps = 0, Listed = 0;
+		UObject* ExampleLevel = nullptr;
+		UObject* ExampleItem = nullptr;
+		UObject* ExampleRecord = nullptr;
+		UObject* ExampleProps = nullptr;
+
+		for (auto Playset : Playsets)
+		{
+			if (Playset->GetName().rfind("Default__", 0) == 0)
+				continue;
+
+			const auto Level = SoftPathOf(Playset, "PlaysetToSpawn");
+			const auto Item = SoftPathOf(Playset, "SpawnItem");
+			const int RecordOffset = Playset->GetOffset("LevelSaveRecord", false);
+			const int CollectionOffset = Playset->GetOffset("PlaysetPropLevelSaveRecordCollection", false);
+			const bool bRecord = RecordOffset != -1 && Playset->Get<UObject*>(RecordOffset);
+			const bool bCollection = CollectionOffset != -1 && Playset->Get<UObject*>(CollectionOffset);
+			const int Props = ArrayCountOf(Playset, "AssociatedPlaysetProps");
+
+			WithLevel += Level != "-" && Level != "n/a";
+			WithItem += Item != "-" && Item != "n/a";
+			WithRecord += bRecord;
+			WithCollection += bCollection;
+			WithProps += Props > 0;
+
+			if (!ExampleLevel && Level != "-" && Level != "n/a") ExampleLevel = Playset;
+			if (!ExampleItem && Item != "-" && Item != "n/a") ExampleItem = Playset;
+			if (!ExampleRecord && (bRecord || bCollection)) ExampleRecord = Playset;
+			if (!ExampleProps && Props > 0) ExampleProps = Playset;
+
+			if (Listed++ < 120)
+				LOG_INFO(LogCreative, "Survey playset {}: level {}, spawn item {}, level save record {}, record collection {}, {} props", Playset->GetName(), Level, Item, bRecord ? "yes" : "no", bCollection ? "yes" : "no", Props);
+		}
+
+		LOG_INFO(LogCreative, "Survey playsets: {} loaded; {} with a level to stream, {} with a spawn item, {} with a level save record, {} with a record collection, {} with props", Listed, WithLevel, WithItem, WithRecord, WithCollection, WithProps);
+
+		PropDump::DumpObject("Survey example playset with a level", ExampleLevel, 3, 160);
+		PropDump::DumpObject("Survey example playset with a spawn item", ExampleItem, 3, 160);
+		PropDump::DumpObject("Survey example playset with a record", ExampleRecord, 3, 160);
+		PropDump::DumpObject("Survey example playset with props", ExampleProps, 3, 160);
+	}
+
+	// --- props
+	{
+		auto Props = GetAllObjectsOfClass<UObject>(PropClass);
+		int WithRecord = 0, Listed = 0;
+		UObject* Example = nullptr;
+
+		for (auto Prop : Props)
+		{
+			if (Prop->GetName().rfind("Default__", 0) == 0)
+				continue;
+
+			const int Offset = Prop->GetOffset("ActorSaveRecord", false);
+			const bool bRecord = Offset != -1 && Prop->Get<UObject*>(Offset);
+			WithRecord += bRecord;
+			++Listed;
+
+			if (bRecord && !Example)
+				Example = Prop;
+		}
+
+		LOG_INFO(LogCreative, "Survey props: {} loaded, {} with an actor save record", Listed, WithRecord);
+
+		if (Example)
+		{
+			PropDump::DumpObject("Survey example prop with a record", Example, 3, 120);
+			DescribeRecord("Survey example prop record", Example->Get<UObject*>(Example->GetOffset("ActorSaveRecord", false)));
+		}
+	}
+
+	// --- records
+	{
+		auto Records = GetAllObjectsOfClass<UObject>(RecordClass);
+		int Listed = 0;
+
+		for (auto Record : Records)
+		{
+			if (Record->GetName().rfind("Default__", 0) == 0)
+				continue;
+
+			if (Listed++ < 30)
+			{
+				static auto TemplatesOffset = Record->GetOffset("TemplateRecords", false);
+				static auto InstancesOffset = Record->GetOffset("ActorInstanceRecords", false);
+				LOG_INFO(LogCreative, "Survey record {}: {} templates, {} actor instances", Record->GetFullName(), TemplatesOffset == -1 ? -1 : MapCount((char*)Record + TemplatesOffset), InstancesOffset == -1 ? -1 : MapCount((char*)Record + InstancesOffset));
+			}
+		}
+
+		LOG_INFO(LogCreative, "Survey records: {} level save records are loaded", Listed);
+	}
+
+	LOG_INFO(LogCreative, "=== end of the creative data survey ===");
+}
+
+// A playset that was just thrown: everything it holds, its first props and their records (the first few different playsets only).
+static void InspectPlayset(UFortPlaysetItemDefinition* Playset)
+{
+	static std::set<std::string> Done;
+	const auto Name = Playset->GetName();
+
+	if (Done.size() >= 8 || !Done.insert(Name).second)
+		return;
+
+	if (Done.size() == 1)
+		CreativeIsland::DumpCreativeData("the first thrown prefab");
+
+	PropDump::DumpObject("Playset dump " + Name, Playset, 3, 260);
+
+	static auto PropClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlaysetPropItemDefinition");
+	const int PropsOffset = Playset->GetOffset("AssociatedPlaysetProps", false);
+
+	if (PropsOffset == -1 || !PropClass || !Readable((char*)Playset + PropsOffset, 16))
+		return;
+
+	char* Props = *(char**)((char*)Playset + PropsOffset);
+	const int Count = *(int*)((char*)Playset + PropsOffset + 8);
+
+	for (int i = 0; Props && i < Count && i < 3; ++i)
+	{
+		if (!Readable(Props + (size_t)i * 0x28, 0x28))
+			break;
+
+		auto& Soft = *(TSoftObjectPtr<UObject>*)(Props + (size_t)i * 0x28);
+		UObject* Prop = Soft.IsValid() ? Soft.Get(PropClass, true) : nullptr;
+		const std::string Label = "Prop dump " + Name + " #" + std::to_string(i);
+
+		PropDump::DumpObject(Label, Prop, 3, 160);
+
+		const int RecordOffset = Prop ? Prop->GetOffset("ActorSaveRecord", false) : -1;
+		UObject* Record = RecordOffset == -1 ? nullptr : Prop->Get<UObject*>(RecordOffset);
+
+		if (Record)
+		{
+			PropDump::DumpObject(Label + " record", Record, 2, 120);
+			DescribeRecord(Label + " record", Record);
+		}
+		else if (Prop)
+			LOG_INFO(LogCreative, "{}: the prop has no actor save record (pointer null)", Label);
+	}
+}
+
 void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 {
 	// The grenade's OnLoaded callback fires for every asset it loads (sounds, effects, ...), so only a real playset is used. Anything else is ignored.
@@ -1137,6 +1730,8 @@ void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 				SizeXOffset == -1 ? -1 : UsePlayset->Get<int>(SizeXOffset), SizeXOffset == -1 ? -1 : UsePlayset->Get<int>(SizeXOffset + 4), SizeXOffset == -1 ? -1 : UsePlayset->Get<int>(SizeXOffset + 8),
 				PropsOffset == -1 ? -1 : *(int*)((char*)UsePlayset + PropsOffset + 8));
 		}
+
+		InspectPlayset(UsePlayset);
 
 		// Step 0: the playset's own function that spawns its actors around an actor (here the prefab volume). If the game's code for it is present, the
 		// actors are ordinary replicated actors and every client sees them. Judged by whether the number of actors in the world went up.
@@ -1905,6 +2500,12 @@ namespace CreativeMinigame
 		bInTick = true;
 
 		CreativeIsland::TickProbes();
+
+		if (Globals::bDumpCreativeDataRequested)
+		{
+			Globals::bDumpCreativeDataRequested = false;
+			CreativeIsland::DumpCreativeData("button");
+		}
 
 		if (!Globals::bDriveMinigames)
 		{

@@ -327,6 +327,9 @@ static inline void StaticUI()
 	if (IsCreativeGame() && ImGui::Button("Write the creative state to the log"))
 		CreativeIsland::DumpState("button", 1000);
 
+	if (IsCreativeGame() && ImGui::Button("Write what the creative data holds to the log"))
+		Globals::bDumpCreativeDataRequested = true;
+
 	if (IsCreativeGame())
 		ImGui::Checkbox("Activate thrown prefab volumes (experimental)", &Globals::bLoadThrownPrefabs);
 
