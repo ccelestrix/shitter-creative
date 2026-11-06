@@ -318,6 +318,25 @@ namespace ForceLog
 
         path += "\\Saved\\Logs\\FortniteGame.log";
 
+        // An installed build keeps its saved files under %LOCALAPPDATA%\FortniteGame\Saved; the newer of the two logs is the one in use.
+        {
+            char* local = nullptr;
+            size_t length = 0;
+
+            if (_dupenv_s(&local, &length, "LOCALAPPDATA") == 0 && local)
+            {
+                const std::string other = std::string(local) + "\\FortniteGame\\Saved\\Logs\\FortniteGame.log";
+                free(local);
+
+                WIN32_FILE_ATTRIBUTE_DATA a{}, b{};
+                const bool hasA = GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &a) != 0;
+                const bool hasB = GetFileAttributesExA(other.c_str(), GetFileExInfoStandard, &b) != 0;
+
+                if (hasB && (!hasA || CompareFileTime(&b.ftLastWriteTime, &a.ftLastWriteTime) > 0))
+                    path = other;
+            }
+        }
+
         HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
         if (file == INVALID_HANDLE_VALUE)
@@ -370,6 +389,15 @@ namespace ForceLog
 
         for (size_t i = picked.size() > (size_t)maxLines ? picked.size() - maxLines : 0; i < picked.size(); ++i)
             Write("info", "LogEngine", picked[i].substr(0, 360));
+
+        // and the very last lines as they are (when the process ends, the reason is usually among them)
+        if (std::string(why).find("ended") != std::string::npos)
+        {
+            Write("info", "LogEngine", "The last lines of the engine log:");
+
+            for (size_t i = lines.size() > 40 ? lines.size() - 40 : 0; i < lines.size(); ++i)
+                Write("info", "LogEngine", lines[i].substr(0, 360));
+        }
     }
 
     // Called when the game (or something in it) ends the process, so a death with no exception still leaves a line. Says which module called

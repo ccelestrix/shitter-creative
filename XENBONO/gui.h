@@ -324,8 +324,6 @@ static int playerTabTab = MAIN_PLAYERTAB;
 
 static inline void StaticUI()
 {
-	ImGui::Checkbox("Keep the server running if the game tries to end itself (exit code 3)", &Globals::bKeepServerAlive);
-
 	if (IsCreativeGame() && ImGui::Button("Write the creative state to the log"))
 		CreativeIsland::DumpState("button", 1000);
 
