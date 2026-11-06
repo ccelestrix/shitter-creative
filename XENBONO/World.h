@@ -1,5 +1,8 @@
 #pragma once
 
+#include <new>
+#include <cstring>
+
 #include "EngineTypes.h"
 #include "Transform.h"
 #include "Object.h"
@@ -157,52 +160,42 @@ public:
 #else
 // #define USE_VIRTUALALLOC_SPAWNPARAMS
 
+// The parameters are handed to the engine's SpawnActor after this function has returned, so they have to live on. They used to be a local variable of
+// this function (return &addr): a dangling pointer. When the compiler inlined the function it worked; when it did not (the big creative source file
+// stopped inlining it) the engine read whatever was left on the stack as the spawn flags, among them "defer construction": the actor came out with no
+// Blueprint components and its construction script and BeginPlay never ran (every device was inert and invisible). The parameters now sit in a ring of
+// slots that belong to the thread.
+static inline void* NextSpawnParametersSlot()
+{
+	constexpr int SlotSize = 0x100, SlotCount = 64;
+	alignas(16) static thread_local unsigned char Slots[SlotCount][SlotSize];
+	static thread_local unsigned Next = 0;
+
+	void* Slot = Slots[Next++ % SlotCount];
+	memset(Slot, 0, SlotSize);
+	return Slot;
+}
+
 static inline void* CreateSpawnParameters(ESpawnActorCollisionHandlingMethod SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::Undefined, bool bDeferConstruction = false, UObject* Owner = nullptr)
 {
+	static_assert(sizeof(FActorSpawnParameters) <= 0x100 && sizeof(FActorSpawnParametersUE500) <= 0x100, "the spawn parameters slot is too small");
+
 	if (Engine_Version >= 500)
 	{
-#ifdef USE_VIRTUALALLOC_SPAWNPARAMS
-		auto addr = (FActorSpawnParametersUE500*)VirtualAlloc(0, sizeof(FActorSpawnParametersUE500), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-
-		if (!addr)
-			return nullptr;
+		auto addr = new (NextSpawnParametersSlot()) FActorSpawnParametersUE500{};
 
 		addr->Owner = Owner;
 		addr->bDeferConstruction = bDeferConstruction;
 		addr->SpawnCollisionHandlingOverride = SpawnCollisionHandlingOverride;
 		return addr;
-#else
-		FActorSpawnParametersUE500 addr{};
-
-		addr.Owner = Owner;
-		addr.bDeferConstruction = bDeferConstruction;
-		addr.SpawnCollisionHandlingOverride = SpawnCollisionHandlingOverride;
-		return &addr;
-#endif
-	}
-	else
-	{
-#ifdef USE_VIRTUALALLOC_SPAWNPARAMS
-		auto addr = (FActorSpawnParameters*)VirtualAlloc(0, sizeof(FActorSpawnParameters), MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
-
-		if (!addr)
-			return nullptr;
-
-		addr->Owner = Owner;
-		addr->bDeferConstruction = bDeferConstruction;
-		addr->SpawnCollisionHandlingOverride = SpawnCollisionHandlingOverride;
-		return addr;
-#else
-		FActorSpawnParameters addr{};
-
-		addr.Owner = Owner;
-		addr.bDeferConstruction = bDeferConstruction;
-		addr.SpawnCollisionHandlingOverride = SpawnCollisionHandlingOverride;
-		return &addr;
-#endif
 	}
 
-	return nullptr;
+	auto addr = new (NextSpawnParametersSlot()) FActorSpawnParameters{};
+
+	addr->Owner = Owner;
+	addr->bDeferConstruction = bDeferConstruction;
+	addr->SpawnCollisionHandlingOverride = SpawnCollisionHandlingOverride;
+	return addr;
 }
 
 class UWorld : public UObject, public FNetworkNotify
@@ -281,8 +274,6 @@ public:
 		UserTransformPtr.Scale3D = Scale3D;
 
 		auto actor = SpawnActor<ActorType>(Class, UserTransformPtr, SpawnParameters);
-
-		VirtualFree(SpawnParameters, 0, MEM_RELEASE);
 
 		return actor;
 	}

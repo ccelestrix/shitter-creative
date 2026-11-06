@@ -2895,6 +2895,59 @@ static std::string LowerText(std::string Text)
 	return Text;
 }
 
+// Every device map the game has (the asset registry survey listed these 47 in the 6 Nov log). The registry helper below returns nothing when it is asked at
+// the wrong moment, and a device whose playset is not named like its map (PID_CP_Devices_CreativeButton: CP_Devices_Button; the radio's map is in its own
+// folder and called CP_Device_Radio) could not be found without it.
+static const char* const KnownDeviceMaps[] = {
+	"/Game/Creative/Devices/Radio/CP_Device_Radio",
+	"/Game/Creative/Maps/Devices/CP_Devices_AdvStormController",
+	"/Game/Creative/Maps/Devices/CP_Devices_BasicStormController",
+	"/Game/Creative/Maps/Devices/CP_Devices_Billboard",
+	"/Game/Creative/Maps/Devices/CP_Devices_BoulderSpawner",
+	"/Game/Creative/Maps/Devices/CP_Devices_Button",
+	"/Game/Creative/Maps/Devices/CP_Devices_CaptureArea",
+	"/Game/Creative/Maps/Devices/CP_Devices_ChannelSwitchboard",
+	"/Game/Creative/Maps/Devices/CP_Devices_ClassSelector",
+	"/Game/Creative/Maps/Devices/CP_Devices_ClassSettings",
+	"/Game/Creative/Maps/Devices/CP_Devices_ColorChangeTile",
+	"/Game/Creative/Maps/Devices/CP_Devices_CoolCarpet",
+	"/Game/Creative/Maps/Devices/CP_Devices_CreatureManager",
+	"/Game/Creative/Maps/Devices/CP_Devices_CreaturePlacer",
+	"/Game/Creative/Maps/Devices/CP_Devices_DeimosSpawner",
+	"/Game/Creative/Maps/Devices/CP_Devices_DestroyTarget",
+	"/Game/Creative/Maps/Devices/CP_Devices_EliminationManager",
+	"/Game/Creative/Maps/Devices/CP_Devices_ExplosiveBarrel",
+	"/Game/Creative/Maps/Devices/CP_Devices_HUDMessage",
+	"/Game/Creative/Maps/Devices/CP_Devices_HoloScreen",
+	"/Game/Creative/Maps/Devices/CP_Devices_Hover_Platform",
+	"/Game/Creative/Maps/Devices/CP_Devices_ItemGranter",
+	"/Game/Creative/Maps/Devices/CP_Devices_ItemSpawner",
+	"/Game/Creative/Maps/Devices/CP_Devices_ItemSpawnerProp",
+	"/Game/Creative/Maps/Devices/CP_Devices_ItemSpawnerVendingMachine",
+	"/Game/Creative/Maps/Devices/CP_Devices_Jet",
+	"/Game/Creative/Maps/Devices/CP_Devices_KeyLock",
+	"/Game/Creative/Maps/Devices/CP_Devices_LockDevice",
+	"/Game/Creative/Maps/Devices/CP_Devices_MapMarker",
+	"/Game/Creative/Maps/Devices/CP_Devices_MatchmakingPortal",
+	"/Game/Creative/Maps/Devices/CP_Devices_PerceptionTrigger",
+	"/Game/Creative/Maps/Devices/CP_Devices_PinballBumper",
+	"/Game/Creative/Maps/Devices/CP_Devices_PinballFlipper",
+	"/Game/Creative/Maps/Devices/CP_Devices_PowerUp",
+	"/Game/Creative/Maps/Devices/CP_Devices_PropPossessorConfig",
+	"/Game/Creative/Maps/Devices/CP_Devices_Quest",
+	"/Game/Creative/Maps/Devices/CP_Devices_RNG",
+	"/Game/Creative/Maps/Devices/CP_Devices_RoundSettings",
+	"/Game/Creative/Maps/Devices/CP_Devices_ScoreManager",
+	"/Game/Creative/Maps/Devices/CP_Devices_ScreenshotCam",
+	"/Game/Creative/Maps/Devices/CP_Devices_Speaker",
+	"/Game/Creative/Maps/Devices/CP_Devices_StormBeacon",
+	"/Game/Creative/Maps/Devices/CP_Devices_SwordStone",
+	"/Game/Creative/Maps/Devices/CP_Devices_TVScreen",
+	"/Game/Creative/Maps/Devices/CP_Devices_Teleporter",
+	"/Game/Creative/Maps/Devices/CP_Devices_TimerObjective",
+	"/Game/Creative/Maps/Devices/CP_Devices_Trigger",
+};
+
 static std::vector<MapActor> ReadDeviceMap(const std::string& Device)
 {
 	static std::map<std::string, std::vector<MapActor>> Cache;
@@ -2917,7 +2970,21 @@ static std::vector<MapActor> ReadDeviceMap(const std::string& Device)
 			if (Entry.second == "World" && Entry.first.find("/CP_Device") != std::string::npos)
 				DeviceMaps.push_back(Entry);
 
-		LOG_INFO(LogCreative, "Device maps: the registry lists {} maps under /Game/Creative/Maps/Devices", (int)DeviceMaps.size());
+		LOG_INFO(LogCreative, "Device maps: the registry lists {} device maps", (int)DeviceMaps.size());
+
+		// the known ones are added (the registry may have given none)
+		for (const char* Known : KnownDeviceMaps)
+		{
+			bool bHave = false;
+
+			for (auto& Entry : DeviceMaps)
+				bHave = bHave || Entry.first == Known;
+
+			if (!bHave)
+				DeviceMaps.push_back({ Known, "World" });
+		}
+
+		LOG_INFO(LogCreative, "Device maps: {} in all, with the known ones", (int)DeviceMaps.size());
 	}
 
 	// Every device's map is named like this; the registry listing is only the fallback for a map that is named otherwise.
@@ -2955,7 +3022,13 @@ static std::vector<MapActor> ReadDeviceMap(const std::string& Device)
 			return Text;
 		};
 
-		const auto Wanted = Plain(Device);
+		auto Wanted = Plain(Device);
+
+		// names that really differ
+		for (auto& Alias : { std::pair<const char*, const char*>{ "randomnumbergenerator", "rng" }, { "screenshotcamera", "screenshotcam" }, { "propposessorconfigurator", "proppossessorconfig" },
+			{ "proppossessorconfigurator", "proppossessorconfig" }, { "elimination", "eliminationmanager" } })
+			if (Wanted == Alias.first)
+				Wanted = Alias.second;
 
 		for (auto& [Name, Class] : DeviceMaps)
 		{
