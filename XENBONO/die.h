@@ -28,9 +28,11 @@ static inline void LogCreativeProcessEvent(UObject* Object, UFunction* Function)
 
 	if (Found == CallsLeft.end())
 	{
-		const auto FullName = Function->GetFullName();
+				const auto FullName = Function->GetFullName();
 
-		auto Has = [&FullName](const char* Text) { return FullName.find(Text) != std::string::npos; };
+			auto Has = [&FullName](const char* Text) { return FullName.find(Text) != std::string::npos; };
+			const bool bSettings = CreativeSettings::KindOf(Function) != 0; // the settings requests are written down in full, whatever the filter below says
+
 
 		// Every request the client makes of the server (except the movement and camera spam), so a button that does nothing shows up.
 		const bool bServerRequest = Has(":Server") && !Has("ServerMove") && !Has("ServerUpdate") && !Has("ServerTouch") && !Has("ServerAck") && !Has("ServerCheckClient") && !Has("ServerSetSpectator")
@@ -39,7 +41,7 @@ static inline void LogCreativeProcessEvent(UObject* Object, UFunction* Function)
 		const bool bInteresting = bServerRequest || Has("Projectile") || Has("Explod") || Has("Detonat") || (Has("Playset") || Has("Volume") || Has("Grenade") || Has("Minigame") || Has("Creative") || Has("Prefab") || Has("Plot") || Has("Island") || Has("Playspace") || Has("Thermometer") || Has("Throw") || Has("Building:") || Has("BuildingSMActor") || Has("BuildingActor"))
 			&& !Has("Audio") && !Has("Sound") && !Has("Submix") && !Has("PostProcess") && !Has("Physics") && !Has("LevelStreamingVolume") && !Has("Tick") && !Has("Animation") && !Has("Anim");
 
-		Found = CallsLeft.emplace(Function, bInteresting ? 40 : -1).first;
+		Found = CallsLeft.emplace(Function, bSettings ? 500 : (bInteresting ? 40 : -1)).first;
 	}
 
 	if (Found->second <= 0)
@@ -109,7 +111,12 @@ static inline void ProcessEventHook(UObject* Object, UFunction* Function, void* 
 	FScope Scope;
 
 	if (IsCreativeGame())
+	{
 		LogCreativeProcessEvent(Object, Function);
+
+		if (const int SettingsKind = CreativeSettings::KindOf(Function))
+			CreativeSettings::Before(Object, Function, Parameters, SettingsKind);
+	}
 
 	if (Globals::bLogProcessEvent)
 	{
@@ -266,5 +273,8 @@ static inline void ProcessEventHook(UObject* Object, UFunction* Function, void* 
 	{
 		FScope Scope; // what runs after the function (it may call ProcessEvent itself) is not logged again either
 		CreativeAfterProcessEvent(Object, Function, Parameters);
+
+		if (const int SettingsKind = CreativeSettings::KindOf(Function))
+			CreativeSettings::After(Object, Function, Parameters, SettingsKind);
 	}
 }

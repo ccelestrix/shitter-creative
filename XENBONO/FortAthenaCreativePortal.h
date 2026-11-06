@@ -121,6 +121,22 @@ namespace CreativeIsland
 	void StartPrefabSurvey();
 	/** One step of the survey; does nothing when no survey runs. Called from the minigame driver's tick. */
 	void StepPrefabSurvey();
+	/** Test: places every device (each device playset) in a grid next to the first player, so each can be tried and the log says what each holds. */
+	void SpawnAllDevices();
+}
+
+// The options of devices and the island's settings (the client's requests to change them): what was asked is written down, checked, and set through the
+// options component when the game's own handler did not.
+namespace CreativeSettings
+{
+	/** Which kind of settings request a function is (0: none). Cheap, called for every ProcessEvent in a creative game. */
+	int KindOf(class UFunction* Function);
+	/** Before the game's handler of the request runs. */
+	void Before(class UObject* Context, class UFunction* Function, void* Params, int Kind);
+	/** After the game's handler of the request ran. */
+	void After(class UObject* Context, class UFunction* Function, void* Params, int Kind);
+	/** What a device that was just placed holds (options component, who may edit it, its properties once per kind of device). */
+	void DescribeDevice(class UObject* Device, class UObject* BuilderController);
 }
 
 // Start Game / End Game. The game's server-side minigame flow is missing from this executable: after Start the island's minigame stops in

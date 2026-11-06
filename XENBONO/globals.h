@@ -21,6 +21,7 @@ namespace Globals
 	// Set by the GUI button; the game thread writes the creative data survey to the log on its next tick.
 	extern inline bool bDumpCreativeDataRequested = false;
 	extern inline bool bSurveyPrefabsRequested = false;
+	extern inline bool bSpawnAllDevicesRequested = false;
 	extern inline bool bCreative = false; // the Creative tick box: opens the creative hub map. Off by default, 12.41 runs the creative playlist on the normal map.
 	extern inline bool bGoingToPlayEvent = false;
 	extern inline bool bEnableAGIDs = true;

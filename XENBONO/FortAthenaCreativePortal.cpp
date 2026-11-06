@@ -3050,8 +3050,516 @@ static std::vector<MapActor> ReadDeviceMap(const std::string& Device)
 	return Result;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Settings. A device's options and the island's settings are the same thing in this game: a FortActorOptionsComponent on the actor (the island's
+// settings machine has a ToyOptionsComponent, which is one), holding the changed options as overrides (PlayerOptionData, replicated). The client's
+// options screen changes them with a request to the server: ServerUpdateActorOptions(actor, keys, values) for a device, ServerUpdateGameplayOptions for
+// the island's game settings, ServerUpdateMessageComponents for message devices (billboard, HUD message). The request handlers are the game's own
+// native code. They were never visible in the log before, because the log filter threw away every function called ServerUpdate...
+//
+// What this does: writes every such request (what was asked, what the options were before and are after), checks that the game's handler really set
+// them, and when it did not sets them itself through the options component's own functions (SetPropertyOverrideValues, SetPropertyOverrides).
+// ---------------------------------------------------------------------------------------------------------------------
+namespace CreativeSettings
+{
+	enum { None = 0, ActorOptions, GameplayOptions, ItemListOptions, MessageComponents, GameDescription, Interact, DeviceButton, KindCount };
+
+	struct Option
+	{
+		std::string Key, Value;
+	};
+
+	int KindOf(UFunction* Function)
+	{
+		static UFunction* Functions[KindCount] = {};
+		static const bool bLooked = [&]() {
+			Functions[ActorOptions] = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.ServerUpdateActorOptions");
+			Functions[GameplayOptions] = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.ServerUpdateGameplayOptions");
+			Functions[ItemListOptions] = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.ServerUpdateItemListOptions");
+			Functions[MessageComponents] = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.ServerUpdateMessageComponents");
+			Functions[GameDescription] = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.ServerUpdateGameDescriptionData");
+			Functions[Interact] = FindObject<UFunction>(L"/Script/FortniteGame.FortControllerComponent_Interaction.ServerAttemptInteract");
+			Functions[DeviceButton] = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.ServerBroadcastDeviceButtonComponentClickedDelegate");
+			return true;
+		}();
+
+		(void)bLooked;
+
+		if (!Function)
+			return None;
+
+		for (int Kind = 1; Kind < KindCount; ++Kind)
+			if (Functions[Kind] == Function)
+				return Kind;
+
+		return None;
+	}
+
+	static std::string TextOf(const FString& Text)
+	{
+		return Text.Data.Data && Readable(Text.Data.Data, 2) ? Text.ToString() : std::string();
+	}
+
+	static std::vector<Option> ReadOptions(const TArray<FString>& Keys, const TArray<FString>& Values)
+	{
+		std::vector<Option> Result;
+
+		for (int i = 0; i < Keys.Num() && i < 200; ++i)
+			Result.push_back({ TextOf(Keys.at(i)), i < Values.Num() ? TextOf(Values.at(i)) : std::string() });
+
+		return Result;
+	}
+
+	// A TMap<FString, FString> read from raw memory (the same layout as the playset's class counts: a sparse array of 0x28 byte entries, the key
+	// at +0 and the value at +0x10).
+	static std::vector<Option> ReadStringMap(const char* Map)
+	{
+		std::vector<Option> Result;
+		const int Count = MapCount(Map);
+
+		if (Count <= 0 || Count > 5000 || !Readable(Map, 0x38))
+			return Result;
+
+		const char* Data = *(const char* const*)Map;
+		const int Slots = *(const int*)(Map + 8);
+		const int NumBits = *(const int*)(Map + 0x28);
+		const unsigned* Flags = NumBits > 128 ? *(const unsigned* const*)(Map + 0x20) : (const unsigned*)(Map + 0x10);
+
+		if (!Data || Slots <= 0 || Slots > 100000 || !Readable(Flags, (size_t)((Slots + 31) / 32) * 4))
+			return Result;
+
+		for (int i = 0; i < Slots; ++i)
+		{
+			if (!(Flags[i / 32] & (1u << (i % 32))))
+				continue;
+
+			const char* Entry = Data + (size_t)i * 0x28;
+
+			if (!Readable(Entry, 0x28))
+				break;
+
+			Result.push_back({ TextOf(*(const FString*)Entry), TextOf(*(const FString*)(Entry + 0x10)) });
+		}
+
+		return Result;
+	}
+
+	// An FString in memory the engine allocator gave out (so that whatever frees it later may).
+	static void MakeString(char* Destination, const std::string& Text)
+	{
+		const std::wstring Wide(Text.begin(), Text.end());
+		const int Num = (int)Wide.size() + 1;
+		auto Buffer = (wchar_t*)FMemory::Realloc(nullptr, (size_t)Num * sizeof(wchar_t), 0);
+		memcpy(Buffer, Wide.c_str(), (size_t)Num * sizeof(wchar_t));
+		*(wchar_t**)Destination = Buffer;
+		*(int*)(Destination + 8) = Num;
+		*(int*)(Destination + 12) = Num;
+	}
+
+	// A TMap<FString, FString> built by hand: one hash bucket (every lookup walks the chain, which is correct for any hash), up to 100 entries.
+	static void BuildStringMap(char* Map, const std::vector<Option>& Entries)
+	{
+		memset(Map, 0, 0x50);
+		const int N = (int)(std::min)(Entries.size(), (size_t)100);
+
+		if (N == 0)
+			return;
+
+		auto Data = (char*)FMemory::Realloc(nullptr, (size_t)N * 0x28, 0);
+		memset(Data, 0, (size_t)N * 0x28);
+
+		for (int i = 0; i < N; ++i)
+		{
+			char* Entry = Data + (size_t)i * 0x28;
+			MakeString(Entry, Entries[i].Key);
+			MakeString(Entry + 0x10, Entries[i].Value);
+			*(int*)(Entry + 0x20) = i - 1; // the next entry in the same bucket
+			*(int*)(Entry + 0x24) = 0; // the bucket
+		}
+
+		*(char**)Map = Data;
+		*(int*)(Map + 0x08) = N;
+		*(int*)(Map + 0x0C) = N;
+
+		auto Words = (unsigned*)(Map + 0x10);
+
+		for (int i = 0; i < N; ++i)
+			Words[i / 32] |= 1u << (i % 32);
+
+		*(int*)(Map + 0x28) = N; // bits used
+		*(int*)(Map + 0x2C) = 128; // bits the inline allocation holds
+		*(int*)(Map + 0x30) = -1; // no free entries
+		*(int*)(Map + 0x34) = 0;
+		*(int*)(Map + 0x38) = N - 1; // the one bucket points at the last entry, which links back to the others
+		*(int*)(Map + 0x48) = 1; // the hash has one bucket
+	}
+
+	static UObject* OptionsComponentOf(UObject* Actor)
+	{
+		static auto ComponentClass = FindObject<UClass>(L"/Script/FortniteGame.FortActorOptionsComponent");
+
+		if (!Actor || !ComponentClass || !PropDump::IsLiveObject(Actor))
+			return nullptr;
+
+		return (UObject*)((AActor*)Actor)->GetComponentByClass(ComponentClass);
+	}
+
+	static bool CurrentOptions(UObject* Component, std::vector<Option>& Out)
+	{
+		auto Function = Component ? Component->FindFunction("GetPropertyOverrides") : nullptr;
+
+		if (!Function)
+			return false;
+
+		struct { char Map[0x50]; bool ReturnValue; char Pad[7]; } Params{};
+
+		if (!SafeProcessEvent(Component, Function, &Params))
+			return false;
+
+		Out = ReadStringMap(Params.Map);
+		return true;
+	}
+
+	// Sets options on a component with its own functions; the one that only changes values first.
+	static bool ApplyOptions(UObject* Component, const std::vector<Option>& Wanted)
+	{
+		for (const char* Name : { "SetPropertyOverrideValues", "SetPropertyOverrides" })
+		{
+			auto Function = Component->FindFunction(Name);
+
+			if (!Function)
+				continue;
+
+			struct { char Map[0x50]; bool ReturnValue; char Pad[7]; } Params{};
+			BuildStringMap(Params.Map, Wanted);
+			const bool bRan = SafeProcessEvent(Component, Function, &Params);
+			LOG_INFO(LogCreative, "Settings: {} on {} {} and returned {}", Name, Describe(Component), bRan ? "ran" : "FAILED (exception)", Params.ReturnValue);
+
+			if (bRan && Params.ReturnValue)
+				return true;
+		}
+
+		return false;
+	}
+
+	static int Matching(const std::vector<Option>& Wanted, const std::vector<Option>& Now)
+	{
+		int Count = 0;
+
+		for (auto& W : Wanted)
+			for (auto& N : Now)
+				if (N.Key == W.Key && N.Value == W.Value)
+				{
+					++Count;
+					break;
+				}
+
+		return Count;
+	}
+
+	static std::string Summary(const std::vector<Option>& Options, size_t Max = 14)
+	{
+		std::string Text;
+
+		for (size_t i = 0; i < Options.size() && i < Max; ++i)
+			Text += std::format("{}{}={}", i ? ", " : "", Options[i].Key, Options[i].Value);
+
+		if (Options.size() > Max)
+			Text += std::format(", ... ({} more)", (int)(Options.size() - Max));
+
+		return Text;
+	}
+
+	static UObject* ControllerPawn(UObject* Controller)
+	{
+		static int PawnOffset = -2; // not looked up yet
+
+		if (PawnOffset == -2 && Controller)
+			PawnOffset = Controller->GetOffset("Pawn", false);
+
+		return Controller && PawnOffset >= 0 ? Controller->Get<UObject*>(PawnOffset) : nullptr;
+	}
+
+	static UObject* FirstController()
+	{
+		static auto ControllerClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerControllerAthena");
+		UObject* Found = nullptr;
+
+		if (ControllerClass)
+		{
+			auto Controllers = UGameplayStatics::GetAllActorsOfClass(GetWorld(), ControllerClass);
+			Found = Controllers.Num() > 0 ? Controllers.at(0) : nullptr;
+			Controllers.Free();
+		}
+
+		return Found;
+	}
+
+	// The island's settings machine (what the settings screen of the phone edits).
+	static UObject* SettingsMachine()
+	{
+		static auto MachineClass = FindObject<UClass>(L"/Script/FortniteGame.FortMinigameSettingsBuilding");
+		UObject* Found = nullptr;
+
+		if (MachineClass)
+		{
+			auto Machines = UGameplayStatics::GetAllActorsOfClass(GetWorld(), MachineClass);
+			Found = Machines.Num() > 0 ? Machines.at(0) : nullptr;
+			Machines.Free();
+		}
+
+		return Found;
+	}
+
+	// Can the player edit this options component, as the game itself says? (the client asks the same question before it opens the screen)
+	static void LogEditAccess(UObject* Component, UObject* Pawn)
+	{
+		if (!Component)
+			return;
+
+		auto CanEdit = Component->FindFunction("CanEditOptionsComponent");
+		auto EditorV2 = Component->FindFunction("GetPropertyEditorV2Enabled");
+
+		struct { UObject* Pawn; bool ReturnValue; char Pad[7]; } Can{ Pawn, false };
+		struct { bool ReturnValue; char Pad[7]; } V2{};
+
+		const bool bCan = CanEdit && Pawn && SafeProcessEvent(Component, CanEdit, &Can);
+		const bool bV2 = EditorV2 && SafeProcessEvent(Component, EditorV2, &V2);
+
+		LOG_INFO(LogCreative, "Settings:   {}: CanEditOptionsComponent for {} -> {}, PropertyEditorV2 -> {}", Describe(Component), Describe(Pawn), bCan ? (Can.ReturnValue ? "yes" : "NO") : "unknown",
+			bV2 ? (V2.ReturnValue ? "yes" : "no") : "unknown");
+	}
+
+	// The change of an actor's options, before and after the game's own handler.
+	static void HandleActorOptions(UObject* Controller, void* Params, bool bAfter)
+	{
+		struct Request { UObject* Target; TArray<FString> Keys; TArray<FString> Values; };
+		auto& R = *(Request*)Params;
+		const auto Wanted = ReadOptions(R.Keys, R.Values);
+		auto Component = OptionsComponentOf(R.Target);
+
+		if (!bAfter)
+		{
+			LOG_INFO(LogCreative, "Settings: {} asks to change {} option(s) of {} ({}): {}", Describe(Controller), (int)Wanted.size(), Describe(R.Target), Component ? "has an options component" : "NO options component",
+				Summary(Wanted));
+
+			std::vector<Option> Before;
+
+			if (Component && CurrentOptions(Component, Before))
+				LOG_INFO(LogCreative, "Settings:   before: {} option(s) set: {}", (int)Before.size(), Summary(Before));
+
+			LogEditAccess(Component, ControllerPawn(Controller));
+			return;
+		}
+
+		if (!Component || Wanted.empty())
+			return;
+
+		std::vector<Option> Now;
+
+		if (!CurrentOptions(Component, Now))
+		{
+			LOG_WARN(LogCreative, "Settings:   the options of {} can not be read (no GetPropertyOverrides)", Describe(R.Target));
+			return;
+		}
+
+		int Set = Matching(Wanted, Now);
+		LOG_INFO(LogCreative, "Settings:   after the game's handler: {} of {} requested option(s) are set ({} set in all): {}", Set, (int)Wanted.size(), (int)Now.size(), Summary(Now));
+
+		if (Set >= (int)Wanted.size())
+			return;
+
+		// the game did not take them: set them through the component
+		std::vector<Option> Missing;
+
+		for (auto& W : Wanted)
+			if (Matching({ W }, Now) == 0)
+				Missing.push_back(W);
+
+		LOG_WARN(LogCreative, "Settings:   {} option(s) were not applied, setting them: {}", (int)Missing.size(), Summary(Missing));
+		ApplyOptions(Component, Missing);
+
+		if (CurrentOptions(Component, Now))
+		{
+			Set = Matching(Wanted, Now);
+			LOG_INFO(LogCreative, "Settings:   after our own change: {} of {} requested option(s) are set: {}", Set, (int)Wanted.size(), Summary(Now));
+		}
+
+		if (auto Actor = (AActor*)R.Target)
+			Actor->ForceNetUpdate();
+	}
+
+	// The island's game settings (time limit, teams, lives ...): the settings machine's options component takes them.
+	static void HandleGameplayOptions(UObject* Controller, void* Params, bool bAfter)
+	{
+		struct Request { TArray<FString> Keys; TArray<FString> Values; };
+		auto& R = *(Request*)Params;
+		const auto Wanted = ReadOptions(R.Keys, R.Values);
+		auto Machine = SettingsMachine();
+		auto Component = OptionsComponentOf(Machine);
+
+		if (!bAfter)
+		{
+			LOG_INFO(LogCreative, "Settings: {} asks to change {} game option(s) (settings machine {}, {}): {}", Describe(Controller), (int)Wanted.size(), Describe(Machine),
+				Component ? "has an options component" : "NO options component", Summary(Wanted, 30));
+
+			std::vector<Option> Before;
+
+			if (Component && CurrentOptions(Component, Before))
+				LOG_INFO(LogCreative, "Settings:   before: {} option(s) set on the machine: {}", (int)Before.size(), Summary(Before));
+
+			LogEditAccess(Component, ControllerPawn(Controller));
+			return;
+		}
+
+		if (!Component || Wanted.empty())
+			return;
+
+		std::vector<Option> Now;
+
+		if (!CurrentOptions(Component, Now))
+			return;
+
+		const int Set = Matching(Wanted, Now);
+		LOG_INFO(LogCreative, "Settings:   after the game's handler: {} of {} requested option(s) are on the machine ({} set in all): {}", Set, (int)Wanted.size(), (int)Now.size(), Summary(Now, 30));
+
+		if (Set >= (int)Wanted.size())
+			return;
+
+		std::vector<Option> Missing;
+
+		for (auto& W : Wanted)
+			if (Matching({ W }, Now) == 0)
+				Missing.push_back(W);
+
+		LOG_WARN(LogCreative, "Settings:   {} game option(s) are not on the machine, setting them there: {}", (int)Missing.size(), Summary(Missing, 30));
+		ApplyOptions(Component, Missing);
+
+		if (CurrentOptions(Component, Now))
+			LOG_INFO(LogCreative, "Settings:   after our own change: {} of {} requested option(s) are on the machine", Matching(Wanted, Now), (int)Wanted.size());
+
+		if (auto Actor = (AActor*)Machine)
+			Actor->ForceNetUpdate();
+	}
+
+	void Before(UObject* Context, UFunction* Function, void* Params, int Kind)
+	{
+		if (!Params)
+			return;
+
+		switch (Kind)
+		{
+		case ActorOptions:
+			HandleActorOptions(Context, Params, false);
+			break;
+		case GameplayOptions:
+			HandleGameplayOptions(Context, Params, false);
+			break;
+		case ItemListOptions:
+		{
+			struct Request { UObject* Container; int Index; int Pad; TArray<FString> Keys; TArray<FString> Values; };
+			auto& R = *(Request*)Params;
+			LOG_INFO(LogCreative, "Settings: {} asks to change an item list entry {} of {}: {}", Describe(Context), R.Index, Describe(R.Container), Summary(ReadOptions(R.Keys, R.Values)));
+			break;
+		}
+		case MessageComponents:
+		{
+			struct Request { TArray<UObject*> Components; TArray<char> Channels; };
+			auto& R = *(Request*)Params;
+			std::string Names;
+
+			for (int i = 0; i < R.Components.Num() && i < 8; ++i)
+				Names += (i ? ", " : "") + Describe(R.Components.at(i));
+
+			LOG_INFO(LogCreative, "Settings: {} asks to change {} message component(s): {}", Describe(Context), R.Components.Num(), Names);
+			break;
+		}
+		case GameDescription:
+		{
+			struct Request { UObject* Target; };
+			LOG_INFO(LogCreative, "Settings: {} asks to change the game name and description of {}", Describe(Context), Describe(((Request*)Params)->Target));
+			break;
+		}
+		case DeviceButton:
+		{
+			struct Request { UObject* Component; };
+			LOG_INFO(LogCreative, "Settings: {} pressed a device button: {}", Describe(Context), Describe(((Request*)Params)->Component));
+			break;
+		}
+		case Interact:
+		{
+			struct Request { UObject* Target; UObject* Component; uint8_t Type; char Pad[7]; UObject* Data; uint8_t Attempt; char Pad2[3]; int RequestId; };
+			auto& R = *(Request*)Params;
+
+			// players interact all the time; only the first few hundred requests are written down
+			static int Logged = 0;
+
+			if (++Logged > 400)
+				break;
+
+			auto Options = OptionsComponentOf(R.Target);
+
+			LOG_INFO(LogCreative, "Settings: interact request {}: type {}, attempt {}, on {} ({}), component {}", R.RequestId, (int)R.Type, (int)R.Attempt, Describe(R.Target), Options ? "it has an options component" : "no options component",
+				Describe(R.Component));
+
+			if (Options)
+			{
+				auto Pawn = ControllerPawn(FirstController());
+				LogEditAccess(Options, Pawn);
+			}
+
+			break;
+		}
+		}
+	}
+
+	void After(UObject* Context, UFunction* Function, void* Params, int Kind)
+	{
+		if (!Params)
+			return;
+
+		if (Kind == ActorOptions)
+			HandleActorOptions(Context, Params, true);
+		else if (Kind == GameplayOptions)
+			HandleGameplayOptions(Context, Params, true);
+	}
+
+	// What a device holds after it was placed: its options component (the asset that lists its options, what is set, whether the player may edit it) and,
+	// once for each kind of device, every property of the actor.
+	void DescribeDevice(UObject* Device, UObject* BuilderController)
+	{
+		if (!Device)
+			return;
+
+		static std::set<std::string> Dumped;
+		auto Actor = (AActor*)Device;
+		auto Component = OptionsComponentOf(Device);
+
+		static auto ReplicatesOffset = Device->GetOffset("bReplicates", false);
+		static auto ReplicatesMask = ReplicatesOffset == -1 ? (uint8_t)0 : GetFieldMask(Device->GetProperty("bReplicates"));
+
+		LOG_INFO(LogCreative, "Device check: {} at {}, replicates {}, {}", Describe(Device), Where(Actor),
+			ReplicatesOffset != -1 && ReplicatesMask ? (int)Device->ReadBitfieldValue(ReplicatesOffset, ReplicatesMask) : -1, Component ? "has an options component" : "has NO options component");
+
+		if (Component)
+		{
+			static auto OptionsAssetOffset = Component->GetOffset("PlayerOptions", false);
+			std::vector<Option> Set;
+			CurrentOptions(Component, Set);
+
+			LOG_INFO(LogCreative, "Device check:   options asset {}, {} option(s) set: {}", Describe(OptionsAssetOffset == -1 ? nullptr : Component->Get<UObject*>(OptionsAssetOffset)), (int)Set.size(), Summary(Set, 8));
+			LogEditAccess(Component, ControllerPawn(BuilderController));
+		}
+
+		const std::string ClassName = Device->ClassPrivate ? Device->ClassPrivate->GetName() : std::string("?");
+
+		if (Dumped.insert(ClassName).second)
+			PropDump::DumpObject("Device dump " + ClassName, Device, 1, 100);
+	}
+}
+
 // Returns how many actors were spawned for the device (0 when none could be).
-static int BuildOwnDevice(AFortVolume* Volume, UObject* Playset)
+static int BuildOwnDevice(const FVector& Base, UObject* Playset)
 {
 	const std::string Name = Playset->GetName();
 
@@ -3120,8 +3628,7 @@ static int BuildOwnDevice(AFortVolume* Volume, UObject* Playset)
 			OffsetZ = ((const float*)((char*)Playset + LocationOffset))[2];
 	}
 
-	static auto BuildingActorClass = FindObject<UClass>(L"/Script/FortniteGame.BuildingActor");
-	const auto Base = Volume->GetActorLocation();
+		static auto BuildingActorClass = FindObject<UClass>(L"/Script/FortniteGame.BuildingActor");
 	int Spawned = 0;
 
 	if (MapActors.empty())
@@ -3181,6 +3688,7 @@ static int BuildOwnDevice(AFortVolume* Volume, UObject* Playset)
 		}
 
 		LOG_INFO(LogCreative, "Own device {}: spawned {} ({}) at {}", Device, Entry.Class->GetName(), Describe(Spawned_), Where(Spawned_));
+		CreativeSettings::DescribeDevice(Spawned_, Builder);
 	}
 
 	LOG_INFO(LogCreative, "Own device {}: {} actors spawned (builder {}, team {})", Device, Spawned, Describe(Builder), Team);
@@ -3248,6 +3756,70 @@ void CreativeIsland::StepPrefabSurvey()
 	LOG_INFO(LogCreative, "Prefab survey {}/{}: {} is {} x {} x {}, {} piece classes ({} could not be loaded, {} are not pieces); the layout places {} pieces ({}, core {} x {}, {} levels)", (int)SurveyNext,
 		(int)SurveyQueue.size(), Name, Request.SizeX, Request.SizeY, Request.SizeZ, (int)Pieces.size(), Failed, Skipped, (int)Plan.Items.size(), Plan.bExhibit ? "an exhibit" : "a building", Plan.CoreX,
 		Plan.CoreY, Plan.Levels);
+}
+
+// Test: every device playset in a grid next to the first player (8 to a row, 900 apart, on the ground).
+void CreativeIsland::SpawnAllDevices()
+{
+	static auto PlaysetClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlaysetItemDefinition");
+	std::vector<std::string> Packages;
+
+	for (auto& Asset : RegistryAssets("/Game/Playsets", false))
+	{
+		if (Asset.second != "FortPlaysetItemDefinition")
+			continue;
+
+		const auto Short = Asset.first.substr(Asset.first.find_last_of('/') + 1);
+
+		if (Short.rfind("PID_CP_Devices_", 0) == 0 || Short.rfind("PID_019_PC_Device_", 0) == 0 || Short.rfind("PID_CP_Device_", 0) == 0)
+			Packages.push_back(Asset.first);
+	}
+
+	std::sort(Packages.begin(), Packages.end());
+
+	auto Pawn = (AActor*)CreativeSettings::ControllerPawn(CreativeSettings::FirstController());
+
+	if (!Pawn)
+	{
+		LOG_WARN(LogCreative, "Place every device: there is no player pawn to place them next to");
+		return;
+	}
+
+	const auto Where_ = Pawn->GetActorLocation();
+	const FVector Start((float)Where_.X + 1200.f, (float)Where_.Y - 3000.f, (float)Where_.Z - 88.f);
+	LOG_INFO(LogCreative, "Place every device: {} device playsets, starting at {:.0f} {:.0f} {:.0f}", (int)Packages.size(), (double)Start.X, (double)Start.Y, (double)Start.Z);
+
+	int Index = 0, Actors = 0, Failed = 0;
+
+	for (auto& Package : Packages)
+	{
+		const std::string Name = Package.substr(Package.find_last_of('/') + 1);
+		const std::string ObjectPath = Package + "." + Name;
+		const std::wstring Path(ObjectPath.begin(), ObjectPath.end());
+		UObject* Playset = FindObject<UObject>(Path.c_str());
+
+		if (!Playset)
+			Playset = SafeLoadAsset(PlaysetClass, Path.c_str());
+
+		if (!Playset)
+		{
+			LOG_WARN(LogCreative, "Place every device: {} could not be loaded", Name);
+			++Failed;
+			continue;
+		}
+
+		const FVector At(Start.X + (Index % 8) * 900.f, Start.Y + (Index / 8) * 900.f, Start.Z);
+		LOG_INFO(LogCreative, "Place every device: {} ({}) at {:.0f} {:.0f}", Name, Index, (double)At.X, (double)At.Y);
+		const int Placed = BuildOwnDevice(At, Playset);
+
+		if (Placed <= 0)
+			++Failed;
+
+		Actors += Placed;
+		++Index;
+	}
+
+	LOG_INFO(LogCreative, "Place every device: {} playsets, {} actors placed, {} playsets gave nothing", Index, Actors, Failed);
 }
 
 void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
@@ -3453,7 +4025,7 @@ void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 				Built = BuildOwnPrefab(Volume, UsePlayset); // the wood house
 
 			if (Built <= 0)
-				Built = BuildOwnDevice(Volume, UsePlayset);
+								Built = BuildOwnDevice(Volume->GetActorLocation(), UsePlayset);
 
 			if (Built > 0)
 			{
@@ -4208,7 +4780,14 @@ namespace CreativeMinigame
 			CreativeIsland::StartPrefabSurvey();
 		}
 
+				if (Globals::bSpawnAllDevicesRequested)
+		{
+			Globals::bSpawnAllDevicesRequested = false;
+			CreativeIsland::SpawnAllDevices();
+		}
+
 		CreativeIsland::StepPrefabSurvey();
+
 
 		if (!Globals::bDriveMinigames)
 		{

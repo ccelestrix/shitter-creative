@@ -333,6 +333,9 @@ static inline void StaticUI()
 	if (IsCreativeGame() && ImGui::Button("Write every prefab's pieces to the log (takes a minute)"))
 		Globals::bSurveyPrefabsRequested = true;
 
+	if (IsCreativeGame() && ImGui::Button("Test: place every device in a grid next to the first player"))
+		Globals::bSpawnAllDevicesRequested = true;
+
 	if (IsCreativeGame())
 		ImGui::Checkbox("Thrown prefabs: build our own version from building pieces", &Globals::bOwnPrefabs);
 
