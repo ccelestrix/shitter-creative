@@ -1820,6 +1820,31 @@ static ABuildingSMActor* SpawnPiece(UClass* Class, double X, double Y, double Z,
 	if (!Piece)
 		return nullptr;
 
+	// The set pieces (castle walls, farm roofs, bank pillars ...) are placed in levels, where they need not replicate; spawned here they must, or no
+	// client ever sees them. Player pieces replicate already.
+	{
+		static auto ReplicatesOffset = Piece->GetOffset("bReplicates", false);
+		static auto ReplicatesMask = ReplicatesOffset == -1 ? (uint8_t)0 : GetFieldMask(Piece->GetProperty("bReplicates"));
+		static auto SetReplicatesFn = FindObject<UFunction>(L"/Script/Engine.Actor.SetReplicates");
+		static int NotReplicating = 0, Spawned = 0;
+
+		++Spawned;
+
+		const bool bReplicates = ReplicatesOffset != -1 && ReplicatesMask && Piece->ReadBitfieldValue(ReplicatesOffset, ReplicatesMask);
+
+		if (!bReplicates && SetReplicatesFn)
+		{
+			bool bNew = true;
+			Piece->ProcessEvent(SetReplicatesFn, &bNew);
+
+			if (++NotReplicating <= 3)
+				LOG_INFO(LogCreative, "Own prefab: {} did not replicate, it does now ({} of {} spawned pieces so far)", Class->GetName(), NotReplicating, Spawned);
+		}
+
+		Piece->FlushNetDormancy();
+		Piece->ForceNetUpdate();
+	}
+
 	static auto BuildingSMClass = FindObject<UClass>(L"/Script/FortniteGame.BuildingSMActor");
 	static auto BuildingClass = FindObject<UClass>(L"/Script/FortniteGame.BuildingActor");
 
