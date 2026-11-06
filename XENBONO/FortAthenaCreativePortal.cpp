@@ -613,7 +613,7 @@ static std::string NameAt(const void* Pointer)
 
 	const int Index = *(const int*)Pointer;
 
-	if (Index <= 0 || Index > 8000000)
+	if (Index <= 0 || Index > 60000000)
 		return std::format("(not a name: {})", Index);
 
 	return ((const FName*)Pointer)->ToString();
@@ -1000,9 +1000,9 @@ namespace PropDump
 		{
 			const char* KeyProp = *(const char* const*)(Prop + InnerAt);
 			const char* ValueProp = *(const char* const*)(Prop + SecondAt);
-			const int KeyOffset = *(const int*)(Prop + MapLayoutAt);
-			const int ValueOffset = *(const int*)(Prop + MapLayoutAt + 4);
-			const int Stride = *(const int*)(Prop + MapLayoutAt + 16); // the size of one entry with its hash links
+			const int KeyOffset = 0;
+			const int ValueOffset = *(const int*)(Prop + MapLayoutAt);
+			const int Stride = *(const int*)(Prop + MapLayoutAt + 12); // the size of one entry with its hash links
 			const int Count = MapCount(Address);
 
 			Line(std::format("{} entries, key {}, value {} (key at +{}, value at +{}, {} bytes per entry; layout ints {} {} {} {} {} {})", Count, KeyProp && Readable(KeyProp, 0x80) ? TypeOf(KeyProp) : std::string("?"),
@@ -1472,9 +1472,19 @@ static void SurveyAssetRegistry()
 
 	LOG_INFO(LogCreative, "Asset registry: {}", Registry.Object->GetFullName());
 
-	auto ByPathFn = FindObject<UFunction>(L"/Script/AssetRegistry.AssetRegistry.GetAssetsByPath");
-	auto ByClassFn = FindObject<UFunction>(L"/Script/AssetRegistry.AssetRegistry.GetAssetsByClass");
-	auto PathsFn = FindObject<UFunction>(L"/Script/AssetRegistry.AssetRegistry.GetAllCachedPaths");
+	auto Lookup = [&](const char* Name, const wchar_t* InterfacePath) -> UFunction* {
+		UFunction* Function = Registry.Object->FindFunction(Name);
+
+		if (!Function)
+			Function = FindObject<UFunction>(InterfacePath);
+
+		LOG_INFO(LogCreative, "Asset registry: function {} {}", Name, Function ? "found" : "NOT FOUND");
+		return Function;
+	};
+
+	auto ByPathFn = Lookup("GetAssetsByPath", L"/Script/AssetRegistry.AssetRegistry:GetAssetsByPath");
+	auto ByClassFn = Lookup("GetAssetsByClass", L"/Script/AssetRegistry.AssetRegistry:GetAssetsByClass");
+	auto PathsFn = Lookup("GetAllCachedPaths", L"/Script/AssetRegistry.AssetRegistry:GetAllCachedPaths");
 
 	// The package paths that look like creative content.
 	if (PathsFn)
