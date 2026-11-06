@@ -115,6 +115,8 @@ namespace CreativeIsland
 	void DumpCreativeData(const char* Why);
 	/** A piece a player just built: makes sure it replicates, and a moment later writes whether a client has a channel for it. */
 	void WatchPiece(class AActor* Piece);
+	/** Every property of an object with its value (see PropDump), to the creative log. */
+	void DumpObjectToLog(const std::string& Label, UObject* Object, int Depth, int MaxLines);
 }
 
 // Start Game / End Game. The game's server-side minigame flow is missing from this executable: after Start the island's minigame stops in

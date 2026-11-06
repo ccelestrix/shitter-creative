@@ -1912,6 +1912,11 @@ static void LogIslandStreaming(const std::string& Reason)
 	}
 }
 
+void CreativeIsland::DumpObjectToLog(const std::string& Label, UObject* Object, int Depth, int MaxLines)
+{
+	PropDump::DumpObject(Label, Object, Depth, MaxLines);
+}
+
 // A playset that was just thrown: everything it holds, its first props and their records (the first few different playsets only).
 static void InspectPlayset(UFortPlaysetItemDefinition* Playset)
 {

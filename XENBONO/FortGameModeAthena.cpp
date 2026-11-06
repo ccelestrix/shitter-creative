@@ -358,6 +358,15 @@ static void ReportStreamingFoundations()
 			continue;
 
 		++Shown;
+
+		static bool bDumped = false;
+
+		if (!bDumped)
+		{
+			bDumped = true;
+			CreativeIsland::DumpObjectToLog("Streaming foundation dump " + Foundation->GetName(), Foundation, 2, 150);
+		}
+
 		const auto Location = Foundation->GetActorLocation();
 		static auto StreamInfoOffset = Foundation->GetOffset("LevelStreamInfo", false);
 		static auto StreamedInOffset = Foundation->GetOffset("bServerStreamedInLevel", false);
@@ -474,6 +483,7 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 	static bool bNudged = false;
 	static int Requests = 0; // how many times the missing levels were requested again
 	static bool bEngineLogged = false;
+	static bool bRetriedFoundations = false;
 
 	const ULONGLONG Now = GetTickCount64();
 
@@ -484,11 +494,47 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 	const bool bReport = Now - LastReport >= (Reports < 20 ? 4000 : 20000) && Reports < 40;
 	const bool bNudge = !bNudged && Waited >= 8000;
 	const bool bRequest = false; // asking again through more foundations did not help (and gives the clients more of them to stream)
+	const bool bRetryFoundations = !bRetriedFoundations && Waited >= 3000;
 	const bool bEngineLog = !bEngineLogged && Waited >= 15000;
 	const bool bDirect = !bHubLoadedDirectly && Waited >= 8000;
 
-	if (!bReport && !bNudge && !bRequest && !bEngineLog && !bDirect)
+	if (!bReport && !bNudge && !bRequest && !bEngineLog && !bDirect && !bRetryFoundations)
 		return;
+
+	// The foundations' own streaming did not start at the presetup: asked once more, a few seconds later, in case the world was not ready then.
+	if (bRetryFoundations)
+	{
+		bRetriedFoundations = true;
+
+		static auto FoundationClass = FindObject<UClass>(L"/Script/FortniteGame.BuildingFoundation3x3");
+		static auto OnRepLevelFn = FindObject<UFunction>(L"/Script/FortniteGame.BuildingFoundation.OnRep_LevelToStream");
+		static auto OnRepDataFn = FindObject<UFunction>(L"/Script/FortniteGame.BuildingFoundation.OnRep_DynamicFoundationRepData");
+		auto Actors = FoundationClass ? UGameplayStatics::GetAllActorsOfClass(GetWorld(), FoundationClass) : TArray<AActor*>();
+		int Asked = 0;
+
+		for (int i = 0; i < Actors.Num(); ++i)
+		{
+			auto Foundation = Actors.at(i);
+			static auto LevelToStreamOffset = Foundation ? Foundation->GetOffset("LevelToStream", false) : -1;
+
+			if (!Foundation || LevelToStreamOffset == -1)
+				continue;
+
+			const std::string Level = Foundation->Get<FName>(LevelToStreamOffset).ToString();
+
+			if (Level.empty() || Level == "None")
+				continue;
+
+			if (OnRepLevelFn) Foundation->ProcessEvent(OnRepLevelFn);
+			if (OnRepDataFn) Foundation->ProcessEvent(OnRepDataFn);
+			++Asked;
+		}
+
+		if (FoundationClass)
+			Actors.Free();
+
+		LOG_INFO(LogCreative, "Waiting for the creative hub: asked {} streaming foundations to start streaming once more", Asked);
+	}
 
 	if (bEngineLog)
 	{
@@ -607,6 +653,26 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 				for (auto& Path : LevelPaths)
 					bPresent = bPresent || Path.find(Short) != std::string::npos;
 
+				// a foundation keeps the level it streams in its own LevelStreamInfo
+				{
+					static auto FoundationClass2 = FindObject<UClass>(L"/Script/FortniteGame.BuildingFoundation3x3");
+					auto Foundations = FoundationClass2 ? UGameplayStatics::GetAllActorsOfClass(GetWorld(), FoundationClass2) : TArray<AActor*>();
+
+					for (int f = 0; f < Foundations.Num() && !bPresent; ++f)
+					{
+						auto Foundation = Foundations.at(f);
+						static auto StreamInfoOffset2 = Foundation ? Foundation->GetOffset("LevelStreamInfo", false) : -1;
+						static auto LevelToStreamOffset2 = Foundation ? Foundation->GetOffset("LevelToStream", false) : -1;
+
+						if (Foundation && StreamInfoOffset2 != -1 && LevelToStreamOffset2 != -1 && Foundation->Get<UObject*>(StreamInfoOffset2) &&
+							Foundation->Get<FName>(LevelToStreamOffset2).ToString().find(Short) != std::string::npos)
+							bPresent = true;
+					}
+
+					if (FoundationClass2)
+						Foundations.Free();
+				}
+
 				PlaylistSummary += std::format(" {}={}", Short, bPresent ? "has a streaming level" : "MISSING");
 
 				if (!bPresent)
@@ -634,6 +700,7 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 	if (bDirect)
 	{
 		bHubLoadedDirectly = true;
+		ForceLog::LogEngineLogTail("the game's own streaming of the hub did not start", 70);
 
 		if (Levels.Num() == 0 || !Missing.empty())
 		{
