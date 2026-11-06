@@ -15,6 +15,8 @@ namespace Globals
 	extern inline bool bPrefabMarkReady = false;
 	// Applies the first few saved records of a thrown prefab's props with the volume manager's own ApplyLevelSaveToWorld, and logs where the actors appear.
 	extern inline bool bPrefabApplyRecords = false;
+	// Thrown prefabs are built from ordinary building pieces (the client has no data for the real ones).
+	extern inline bool bOwnPrefabs = true;
 	// Set by the GUI button; the game thread writes the creative data survey to the log on its next tick.
 	extern inline bool bDumpCreativeDataRequested = false;
 	extern inline bool bCreative = false; // the Creative tick box: opens the creative hub map. Off by default, 12.41 runs the creative playlist on the normal map.

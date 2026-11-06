@@ -331,6 +331,9 @@ static inline void StaticUI()
 		Globals::bDumpCreativeDataRequested = true;
 
 	if (IsCreativeGame())
+		ImGui::Checkbox("Thrown prefabs: build our own version from building pieces", &Globals::bOwnPrefabs);
+
+	if (IsCreativeGame())
 		ImGui::Checkbox("Activate thrown prefab volumes (experimental)", &Globals::bLoadThrownPrefabs);
 
 	if (IsCreativeGame())

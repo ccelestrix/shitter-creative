@@ -8,6 +8,8 @@
 #include "hooking.h"
 #include "GameplayStatics.h"
 #include "KismetStringLibrary.h"
+#include "BuildingSMActor.h"
+#include "FortPlayerStateAthena.h"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -1767,6 +1769,167 @@ static void InspectPlayset(UFortPlaysetItemDefinition* Playset)
 	}
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// Our own prefabs. The client's files hold no data for the real ones (no level, no saved records, no positions), so a thrown prefab is built from the
+// ordinary player building pieces instead: a house as big as the prefab's footprint, with a door gap, two walls high and a flat roof. The pieces are
+// the same ones players build with, so they replicate, can be edited and count towards the island's memory.
+// ---------------------------------------------------------------------------------------------------------------------
+static UClass* FindPieceClass(const char* ShortName, const wchar_t* Path)
+{
+	static auto ClassClass = FindObject<UClass>(L"/Script/CoreUObject.Class");
+	static std::map<std::string, UClass*> Cache;
+
+	if (auto It = Cache.find(ShortName); It != Cache.end() && It->second)
+		return It->second;
+
+	UClass* Found = nullptr;
+
+	// A class some player already built with is loaded: look for it by name.
+	for (auto Object : GetAllObjectsOfClass<UObject>(ClassClass))
+	{
+		if (Object->GetName() == ShortName)
+		{
+			Found = (UClass*)Object;
+			break;
+		}
+	}
+
+	if (!Found)
+		Found = FindObject<UClass>(Path);
+
+	if (!Found)
+		Found = LoadObject<UClass>(Path, ClassClass);
+
+	Cache[ShortName] = Found;
+	return Found;
+}
+
+static ABuildingSMActor* SpawnPiece(UClass* Class, double X, double Y, double Z, float Yaw, AFortPlayerControllerAthena* Builder, int Team)
+{
+	FTransform Transform{};
+	FRotator Rotation{};
+	Rotation.Yaw = Yaw;
+	Transform.Translation = FVector((float)X, (float)Y, (float)Z);
+	Transform.Rotation = Rotation.Quaternion();
+	Transform.Scale3D = { 1, 1, 1 };
+
+	auto Piece = GetWorld()->SpawnActor<ABuildingSMActor>(Class, Transform);
+
+	if (!Piece)
+		return nullptr;
+
+	Piece->SetPlayerPlaced(true);
+
+	if (Builder)
+		Piece->InitializeBuildingActor(Builder, Piece, true);
+
+	if (Team >= 0)
+		Piece->SetTeam((unsigned char)Team);
+
+	return Piece;
+}
+
+// Returns how many pieces were built (0 when the playset is not a building prefab).
+static int BuildOwnPrefab(AFortVolume* Volume, UObject* Playset)
+{
+	const int SizeXOffset = Playset->GetOffset("SizeX", false);
+	const int PropsOffset = Playset->GetOffset("AssociatedPlaysetProps", false);
+
+	if (SizeXOffset == -1)
+		return 0;
+
+	int SizeX = Playset->Get<int>(SizeXOffset);
+	int SizeY = Playset->Get<int>(SizeXOffset + 4);
+	const int Props = PropsOffset == -1 || !Readable((char*)Playset + PropsOffset, 16) ? 0 : *(int*)((char*)Playset + PropsOffset + 8);
+
+	// a device or another single thing: nothing to build a house for
+	if (Props <= 0 && SizeX * SizeY <= 1)
+	{
+		LOG_INFO(LogCreative, "Own prefab: {} has no props and is {} x {}, so it is not a building", Playset->GetName(), SizeX, SizeY);
+		return 0;
+	}
+
+	SizeX = (std::max)(2, (std::min)(SizeX, 10));
+	SizeY = (std::max)(2, (std::min)(SizeY, 10));
+
+	auto Wall = FindPieceClass("PBWA_W1_Solid_C", L"/Game/Building/ActorBlueprints/Player/Wood/L1/PBWA_W1_Solid.PBWA_W1_Solid_C");
+	auto Floor = FindPieceClass("PBWA_W1_Floor_C", L"/Game/Building/ActorBlueprints/Player/Wood/L1/PBWA_W1_Floor.PBWA_W1_Floor_C");
+
+	if (!Wall || !Floor)
+	{
+		LOG_WARN(LogCreative, "Own prefab: the wood wall ({}) or floor ({}) class could not be found", Wall ? "found" : "missing", Floor ? "found" : "missing");
+		return 0;
+	}
+
+	// The thrower builds the pieces (their team, the build animation).
+	static auto ControllerClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerControllerAthena");
+	AFortPlayerControllerAthena* Builder = nullptr;
+	{
+		auto Controllers = UGameplayStatics::GetAllActorsOfClass(GetWorld(), ControllerClass);
+
+		for (int i = 0; i < Controllers.Num() && !Builder; ++i)
+		{
+			auto Controller = (AFortPlayerControllerAthena*)Controllers.at(i);
+			const int PlaysetOffset = Controller ? Controller->GetOffset("CurrentPlayset", false) : -1;
+
+			if (Controller && PlaysetOffset != -1 && Controller->Get<UObject*>(PlaysetOffset) == Playset)
+				Builder = Controller;
+		}
+
+		if (!Builder && Controllers.Num() > 0)
+			Builder = (AFortPlayerControllerAthena*)Controllers.at(0);
+
+		Controllers.Free();
+	}
+
+	int Team = -1;
+
+	if (Builder)
+		if (auto State = Cast<AFortPlayerStateAthena, false>(Builder->GetPlayerState()))
+			Team = State->GetTeamIndex();
+
+	// Building pieces sit on a 256 grid and are 512 wide and 384 high; they are placed by a corner, a wall runs from its corner along its own +Y.
+	const auto Center = Volume->GetActorLocation();
+	const double OriginX = std::floor(((double)Center.X - SizeX * 256.0) / 256.0 + 0.5) * 256.0;
+	const double OriginY = std::floor(((double)Center.Y - SizeY * 256.0) / 256.0 + 0.5) * 256.0;
+	const double GroundZ = (double)Center.Z;
+	const int Levels = 2;
+	const double WallHeight = 384.0;
+	const int DoorTile = SizeX / 2;
+
+	int Walls = 0, Floors = 0;
+
+	for (int Level = 0; Level < Levels; ++Level)
+	{
+		const double Z = GroundZ + Level * WallHeight;
+
+		for (int i = 0; i < SizeX; ++i)
+		{
+			// the two edges that run along X (yaw 270 turns +Y into +X); the south one has a door gap on the ground level
+			if (!(Level == 0 && i == DoorTile))
+				Walls += SpawnPiece(Wall, OriginX + i * 512.0, OriginY, Z, 270.f, Builder, Team) != nullptr;
+
+			Walls += SpawnPiece(Wall, OriginX + i * 512.0, OriginY + SizeY * 512.0, Z, 270.f, Builder, Team) != nullptr;
+		}
+
+		for (int j = 0; j < SizeY; ++j)
+		{
+			Walls += SpawnPiece(Wall, OriginX, OriginY + j * 512.0, Z, 0.f, Builder, Team) != nullptr;
+			Walls += SpawnPiece(Wall, OriginX + SizeX * 512.0, OriginY + j * 512.0, Z, 0.f, Builder, Team) != nullptr;
+		}
+	}
+
+	// the roof: a floor piece over every tile
+	for (int i = 0; i < SizeX; ++i)
+		for (int j = 0; j < SizeY; ++j)
+			Floors += SpawnPiece(Floor, OriginX + i * 512.0, OriginY + j * 512.0, GroundZ + Levels * WallHeight, 0.f, Builder, Team) != nullptr;
+
+	LOG_INFO(LogCreative, "Own prefab: built {} walls and {} roof floors for {} ({} x {} tiles, {} props in the real one) from {} {} {}, builder {}, team {}", Walls, Floors, Playset->GetName(), SizeX, SizeY, Props,
+		OriginX, OriginY, GroundZ, Describe(Builder), Team);
+
+	return Walls + Floors;
+}
+
 void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 {
 	// The grenade's OnLoaded callback fires for every asset it loads (sounds, effects, ...), so only a real playset is used. Anything else is ignored.
@@ -1959,6 +2122,19 @@ void CreativeIsland::LoadThrownPrefab(UObject* Projectile, UObject* LoadedAsset)
 			LOG_INFO(LogCreative, "Thrown prefab: step 0 placed the prefab, the other steps are skipped");
 			++Loaded;
 			continue;
+		}
+
+		// Our own version of the prefab, built from building pieces.
+		if (Globals::bOwnPrefabs)
+		{
+			const int Built = BuildOwnPrefab(Volume, UsePlayset);
+
+			if (Built > 0)
+			{
+				CreativeIsland::LogBudget("after an own prefab");
+				++Loaded;
+				continue;
+			}
 		}
 
 		// Step 0b: is the volume manager waiting for something? (read-only unless it is stuck "loading")
