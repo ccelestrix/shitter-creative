@@ -359,11 +359,62 @@ static void ReportStreamingFoundations()
 
 		++Shown;
 		const auto Location = Foundation->GetActorLocation();
-		LOG_INFO(LogCreative, "  streaming foundation {}: level to stream {}, enabled state {}, at {:.0f} {:.0f} {:.0f}", Foundation->GetName(), Level,
-			EnabledStateOffset == -1 ? -1 : (int)Foundation->Get<uint8_t>(EnabledStateOffset), (double)Location.X, (double)Location.Y, (double)Location.Z);
+		static auto StreamInfoOffset = Foundation->GetOffset("LevelStreamInfo", false);
+		static auto StreamedInOffset = Foundation->GetOffset("bServerStreamedInLevel", false);
+		static auto StreamedInMask = StreamedInOffset == -1 ? (uint8_t)0 : GetFieldMask(Foundation->GetProperty("bServerStreamedInLevel"));
+		LOG_INFO(LogCreative, "  streaming foundation {}: level to stream {}, enabled state {}, own streaming level {}, server streamed in {}, at {:.0f} {:.0f} {:.0f}", Foundation->GetName(), Level,
+			EnabledStateOffset == -1 ? -1 : (int)Foundation->Get<uint8_t>(EnabledStateOffset), StreamInfoOffset == -1 ? std::string("n/a") : (Foundation->Get<UObject*>(StreamInfoOffset) ? Foundation->Get<UObject*>(StreamInfoOffset)->GetName() : std::string("none")),
+			StreamedInOffset == -1 ? -1 : (int)Foundation->ReadBitfieldValue(StreamedInOffset, StreamedInMask), (double)Location.X, (double)Location.Y, (double)Location.Z);
 	}
 
 	Actors.Free();
+}
+
+// A streaming foundation only tells the clients to load its level once the server says it has streamed it in (bServerStreamedInLevel, replicated). When
+// the levels were loaded by hand the foundations never get that, so the clients would never load the hub.
+static void MarkFoundationsStreamedIn()
+{
+	static auto FoundationClass = FindObject<UClass>(L"/Script/FortniteGame.BuildingFoundation3x3");
+
+	if (!FoundationClass)
+		return;
+
+	auto Actors = UGameplayStatics::GetAllActorsOfClass(GetWorld(), FoundationClass);
+	int Marked = 0;
+
+	for (int i = 0; i < Actors.Num(); ++i)
+	{
+		auto Foundation = Actors.at(i);
+
+		if (!Foundation)
+			continue;
+
+		static auto LevelToStreamOffset = Foundation->GetOffset("LevelToStream", false);
+		static auto StreamedInOffset = Foundation->GetOffset("bServerStreamedInLevel", false);
+		static auto StreamedInMask = StreamedInOffset == -1 ? (uint8_t)0 : GetFieldMask(Foundation->GetProperty("bServerStreamedInLevel"));
+
+		if (LevelToStreamOffset == -1 || StreamedInOffset == -1 || !StreamedInMask)
+			continue;
+
+		const std::string Level = Foundation->Get<FName>(LevelToStreamOffset).ToString();
+
+		if (Level.empty() || Level == "None")
+			continue;
+
+		Foundation->SetBitfieldValue(StreamedInOffset, StreamedInMask, true);
+
+		static auto OnRepFn = FindObject<UFunction>(L"/Script/FortniteGame.BuildingFoundation.OnRep_ServerStreamedInLevel");
+
+		if (OnRepFn)
+			Foundation->ProcessEvent(OnRepFn);
+
+		Foundation->FlushNetDormancy();
+		Foundation->ForceNetUpdate();
+		++Marked;
+	}
+
+	Actors.Free();
+	LOG_INFO(LogCreative, "{} streaming foundations were marked as streamed in on the server, so the clients load their levels", Marked);
 }
 
 // Is the asset registry still loading its assets? A level that is asked for while it is can fail to start. -1: unknown, 0: finished, 1: still loading.
@@ -1126,6 +1177,8 @@ bool AFortGameModeAthena::Athena_ReadyToStartMatchHook(AFortGameModeAthena* Game
 				}
 
 				if (AllVisibleFn) GameMode->ProcessEvent(AllVisibleFn);
+
+				MarkFoundationsStreamedIn();
 
 				LOG_INFO(LogCreative, "The hub was loaded by hand: told the game its playlist levels have streamed in ({}, {}, {})", StreamedFn ? "streamed" : "no streamed event", ShownFn ? "shown" : "no shown event",
 					AllVisibleFn ? "all visible" : "no all-visible event");
