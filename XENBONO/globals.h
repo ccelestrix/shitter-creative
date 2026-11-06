@@ -17,6 +17,9 @@ namespace Globals
 	extern inline bool bPrefabApplyRecords = false;
 	// Thrown prefabs are built from ordinary building pieces (the client has no data for the real ones).
 	extern inline bool bOwnPrefabs = true;
+	// When the game's own code ends the process with exit code 3 (an abort from a thread of the game, seen about a second after start on some runs), the
+	// calling thread is parked instead, so the server keeps running.
+	extern inline bool bKeepServerAlive = true;
 	// Set by the GUI button; the game thread writes the creative data survey to the log on its next tick.
 	extern inline bool bDumpCreativeDataRequested = false;
 	extern inline bool bCreative = false; // the Creative tick box: opens the creative hub map. Off by default, 12.41 runs the creative playlist on the normal map.

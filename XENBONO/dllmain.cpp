@@ -923,7 +923,21 @@ static VOID (WINAPI* ExitProcessOriginal)(UINT) = nullptr;
 static BOOL WINAPI TerminateProcessHook(HANDLE Process, UINT ExitCode)
 {
     if (Process == GetCurrentProcess() || GetProcessId(Process) == GetCurrentProcessId())
+    {
         ForceLog::LogExit("TerminateProcess", ExitCode, _ReturnAddress());
+
+        // Exit code 3 from a thread of the game itself (the game's code, not this DLL): the thread is parked here instead of ending the server.
+        HMODULE Caller = nullptr;
+
+        if (Globals::bKeepServerAlive && ExitCode == 3 &&
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)_ReturnAddress(), &Caller) && Caller == GetModuleHandleW(nullptr))
+        {
+            ForceLog::Write("critical", "LogCrash", "The game ended the process with exit code 3 from its own thread; that thread is parked and the server keeps running (Globals::bKeepServerAlive)");
+
+            for (;;)
+                Sleep(60000);
+        }
+    }
 
     return TerminateProcessOriginal(Process, ExitCode);
 }
