@@ -168,26 +168,34 @@ UFortPlaysetItemDefinition* CreativeIsland::GetPlotPlayset(UObject* Plot)
 	return Playset;
 }
 
-void CreativeIsland::GiveCreativePhone(AFortPlayerControllerAthena* Controller)
+// The phone. The item goes into the inventory and the client is told to build its phone (ClientCreativePhoneCreated), but the client can only build it
+// from an item it already has: the item is replicated with the next net update, after the call, and the player is also moved onto the island at that moment,
+// so the phone never showed. The grant is therefore checked again and the client told again a few times in the seconds after it (TickPhone, from the driver's tick).
+struct PhoneKick
 {
-	if (!Controller)
-		return;
+	ULONGLONG Next = 0;
+	int Left = 0;
+	int Attempt = 0;
+};
 
+static std::map<UObject*, PhoneKick> PhoneKicks;
+
+static UFortItemDefinition* CreativePhoneItem()
+{
 	static auto CreativePhone = FindObject<UFortItemDefinition>(L"/Game/Athena/Items/Weapons/Prototype/WID_CreativeTool.WID_CreativeTool");
+	return CreativePhone;
+}
 
-	if (!CreativePhone)
-	{
-		LOG_WARN(LogCreative, "WID_CreativeTool was not found, so {} gets no creative phone", Controller->GetName());
-		return;
-	}
+static bool PutPhoneInInventory(AFortPlayerControllerAthena* Controller)
+{
+	auto CreativePhone = CreativePhoneItem();
+	auto WorldInventory = Controller ? Controller->GetWorldInventory() : nullptr;
 
-	auto WorldInventory = Controller->GetWorldInventory();
-
-	if (!WorldInventory)
-		return;
+	if (!CreativePhone || !WorldInventory)
+		return false;
 
 	if (WorldInventory->FindItemInstance(CreativePhone))
-		return;
+		return true;
 
 	bool bShouldUpdate = false;
 	WorldInventory->AddItem(CreativePhone, &bShouldUpdate, 1);
@@ -195,8 +203,71 @@ void CreativeIsland::GiveCreativePhone(AFortPlayerControllerAthena* Controller)
 	if (bShouldUpdate)
 		WorldInventory->Update(Controller);
 
-	LOG_INFO(LogCreative, "Gave {} the creative phone", Controller->GetName());
+	return WorldInventory->FindItemInstance(CreativePhone) != nullptr;
+}
+
+static void TickPhone()
+{
+	if (PhoneKicks.empty())
+		return;
+
+	const ULONGLONG Now = GetTickCount64();
+
+	for (auto It = PhoneKicks.begin(); It != PhoneKicks.end();)
+	{
+		auto Controller = (AFortPlayerControllerAthena*)It->first;
+
+		if (!Controller || !Controller->IsValidLowLevel())
+		{
+			It = PhoneKicks.erase(It);
+			continue;
+		}
+
+		if (Now >= It->second.Next)
+		{
+			++It->second.Attempt;
+			const bool bHad = Controller->GetWorldInventory() && Controller->GetWorldInventory()->FindItemInstance(CreativePhoneItem());
+			const bool bHas = PutPhoneInInventory(Controller);
+
+			LOG_INFO(LogCreative, "Creative phone for {}: {} in the inventory ({}), telling the client again (attempt {})", Controller->GetName(), bHas ? "it is" : "it is NOT", bHad ? "it was already" : "it was put there now",
+				It->second.Attempt);
+			CreativeIsland::CallOnRep(Controller, "ClientCreativePhoneCreated");
+
+			if (--It->second.Left <= 0)
+			{
+				It = PhoneKicks.erase(It);
+				continue;
+			}
+
+			It->second.Next = Now + 3500;
+		}
+
+		++It;
+	}
+}
+
+void CreativeIsland::GiveCreativePhone(AFortPlayerControllerAthena* Controller)
+{
+	if (!Controller)
+		return;
+
+	if (!CreativePhoneItem())
+	{
+		LOG_WARN(LogCreative, "WID_CreativeTool was not found, so {} gets no creative phone", Controller->GetName());
+		return;
+	}
+
+	if (!Controller->GetWorldInventory())
+		return;
+
+	const bool bHad = Controller->GetWorldInventory()->FindItemInstance(CreativePhoneItem()) != nullptr;
+	const bool bHas = PutPhoneInInventory(Controller);
+
+	LOG_INFO(LogCreative, "Gave {} the creative phone ({}, now {})", Controller->GetName(), bHad ? "it had it already" : "it did not have it", bHas ? "in the inventory" : "NOT in the inventory");
 	CallOnRep(Controller, "ClientCreativePhoneCreated");
+
+	// told again 1.5 s, 5 s, 8.5 s and 12 s later (the first call comes before the client has the item)
+	PhoneKicks[Controller] = { GetTickCount64() + 1500, 4, 0 };
 }
 
 void CreativeIsland::SetupSettingsMachine(AFortVolume* Volume)
@@ -769,6 +840,7 @@ static void CheckPieceWatches()
 
 void CreativeIsland::TickProbes()
 {
+	TickPhone();
 	CheckPieceWatches();
 
 	if (Probes.empty())
