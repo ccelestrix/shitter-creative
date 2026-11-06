@@ -298,6 +298,80 @@ namespace ForceLog
         Write("info", "LogInit", line);
     }
 
+    // The engine writes its own log (FortniteGame\Saved\Logs\FortniteGame.log). The lines about levels, streaming, errors and failures near its end are
+    // copied into this log, so the reason a level does not load is here too.
+    inline void LogEngineLogTail(const char* why, int maxLines)
+    {
+        char exePath[MAX_PATH] = {};
+        GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        std::string path = exePath;
+
+        for (int i = 0; i < 3; ++i) // ...\FortniteGame\Binaries\Win64\<exe> -> ...\FortniteGame
+        {
+            const auto slash = path.find_last_of("\\/");
+
+            if (slash == std::string::npos)
+                break;
+
+            path.resize(slash);
+        }
+
+        path += "\\Saved\\Logs\\FortniteGame.log";
+
+        HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+        if (file == INVALID_HANDLE_VALUE)
+        {
+            Write("warn", "LogEngine", std::string("The engine log could not be opened: ") + path);
+            return;
+        }
+
+        LARGE_INTEGER size{};
+        GetFileSizeEx(file, &size);
+        const LONGLONG take = (std::min)((LONGLONG)size.QuadPart, (LONGLONG)600000);
+        std::string data((size_t)take, '\0');
+        LARGE_INTEGER from{};
+        from.QuadPart = size.QuadPart - take;
+        SetFilePointerEx(file, from, nullptr, FILE_BEGIN);
+        DWORD read = 0;
+        ReadFile(file, data.data(), (DWORD)take, &read, nullptr);
+        CloseHandle(file);
+        data.resize(read);
+
+        std::vector<std::string> lines;
+        size_t start = 0;
+
+        for (size_t i = 0; i <= data.size(); ++i)
+        {
+            if (i == data.size() || data[i] == '\n')
+            {
+                if (i > start)
+                    lines.push_back(data.substr(start, i - start));
+
+                start = i + 1;
+            }
+        }
+
+        auto lower = [](std::string text) { for (auto& c : text) c = (char)tolower((unsigned char)c); return text; };
+        std::vector<std::string> picked;
+
+        for (auto& line : lines)
+        {
+            const auto text = lower(line);
+
+            if (text.find("stream") != std::string::npos || text.find("level") != std::string::npos || text.find("foundation") != std::string::npos || text.find("error") != std::string::npos ||
+                text.find("fatal") != std::string::npos || text.find("fail") != std::string::npos || text.find("could not") != std::string::npos || text.find("package") != std::string::npos)
+                picked.push_back(line);
+        }
+
+        char head[256];
+        sprintf_s(head, "Engine log (%s): %d lines read from the end of %s, %d of them about levels, streaming or errors; the last %d follow", why, (int)lines.size(), path.c_str(), (int)picked.size(), maxLines);
+        Write("info", "LogEngine", head);
+
+        for (size_t i = picked.size() > (size_t)maxLines ? picked.size() - maxLines : 0; i < picked.size(); ++i)
+            Write("info", "LogEngine", picked[i].substr(0, 360));
+    }
+
     // Called when the game (or something in it) ends the process, so a death with no exception still leaves a line. Says which module called
     // it and where, so it can be looked up.
     inline void LogExit(const char* What, UINT code, void* returnAddress)
@@ -330,6 +404,7 @@ namespace ForceLog
         }
 
         LogThreads(GetCurrentThreadId(), 12);
+        LogEngineLogTail("when the process ended", 30);
 
         std::string added;
 

@@ -365,12 +365,39 @@ static void ReportStreamingFoundations()
 	Actors.Free();
 }
 
+// Loads a level straight away, the way a level is loaded at runtime when nothing else asks for it (ULevelStreamingDynamic::LoadLevelInstance). Named like
+// the level itself, so that the level has the name a client expects for it.
+static bool LoadLevelInstanceNow(const std::string& LevelPath)
+{
+	static auto Default = FindObject<UObject>(L"/Script/Engine.Default__LevelStreamingDynamic");
+	auto Function = Default ? Default->FindFunction("LoadLevelInstance") : nullptr;
+
+	if (!Function)
+		return false;
+
+	const auto Dot = LevelPath.find('.');
+	const std::string Package = Dot == std::string::npos ? LevelPath : LevelPath.substr(0, Dot);
+	const std::string Short = Package.substr(Package.find_last_of('/') + 1);
+	const std::wstring WidePackage(Package.begin(), Package.end()), WideShort(Short.begin(), Short.end());
+
+	struct { UObject* WorldContextObject; FString LevelName; float Location[3]; float Rotation[3]; bool bOutSuccess; char Pad[7]; FString OptionalLevelNameOverride; UObject* ReturnValue; } Params{};
+	Params.WorldContextObject = GetWorld();
+	Params.LevelName = WidePackage.c_str();
+	Params.OptionalLevelNameOverride = WideShort.c_str();
+
+	Default->ProcessEvent(Function, &Params);
+	LOG_INFO(LogCreative, "LoadLevelInstance({}): success {}, streaming level {}", Package, Params.bOutSuccess, Params.ReturnValue ? Params.ReturnValue->GetName() : std::string("none"));
+	return Params.bOutSuccess;
+}
+
 static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 {
 	static ULONGLONG LastReport = 0;
 	static int Reports = 0;
 	static bool bNudged = false;
 	static int Requests = 0; // how many times the missing levels were requested again
+	static bool bEngineLogged = false;
+	static bool bLoadedDirectly = false;
 
 	const ULONGLONG Now = GetTickCount64();
 
@@ -381,9 +408,17 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 	const bool bReport = Now - LastReport >= (Reports < 20 ? 4000 : 20000) && Reports < 40;
 	const bool bNudge = !bNudged && Waited >= 8000;
 	const bool bRequest = (Requests == 0 && Waited >= 10000) || (Requests == 1 && Waited >= 30000);
+	const bool bEngineLog = !bEngineLogged && Waited >= 15000;
+	const bool bDirect = !bLoadedDirectly && Waited >= 20000;
 
-	if (!bReport && !bNudge && !bRequest)
+	if (!bReport && !bNudge && !bRequest && !bEngineLog && !bDirect)
 		return;
+
+	if (bEngineLog)
+	{
+		bEngineLogged = true;
+		ForceLog::LogEngineLogTail("the hub still has not loaded", 70);
+	}
 
 	if (bReport)
 	{
@@ -517,6 +552,21 @@ static void ReportWaitingForHub(AFortGameStateAthena* GameState)
 			Levels.Num(), PlaylistSummary.empty() ? std::string(" unknown") : PlaylistSummary, Summary);
 
 		ReportStreamingFoundations();
+	}
+
+	// Still no streaming level for a playlist level after 20 s: the game's own way of loading it is not working this time, so it is loaded directly.
+	if (bDirect)
+	{
+		bLoadedDirectly = true;
+
+		if (Levels.Num() == 0 || !Missing.empty())
+		{
+			for (auto& Name : Missing)
+			{
+				LOG_WARN(LogCreative, "Waiting for the creative hub: {} still has no streaming level after {} s, loading it directly", Name.ToString(), (int)(Waited / 1000));
+				LoadLevelInstanceNow(Name.ToString());
+			}
+		}
 	}
 
 	// A playlist level that still has no streaming level was lost on the way: it is requested again, the same way the first request was made.
