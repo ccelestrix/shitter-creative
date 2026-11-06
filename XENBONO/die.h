@@ -83,10 +83,30 @@ static inline void CreativeAfterProcessEvent(UObject* Object, UFunction* Functio
 	CreativeMinigame::Tick();
 }
 
+// True while this thread is inside the hook's own work. GetFullName/GetPathName are ProcessEvent calls, so the logging below re-entered the hook, and
+// the logging's lock (taken already) was taken a second time: an exception that ended the server (seen in the engine log: _Throw_Cpp_error from
+// LogCreativeProcessEvent, die.h).
+static inline thread_local bool bInProcessEventHook = false;
+
 static inline void ProcessEventHook(UObject* Object, UFunction* Function, void* Parameters)
 {
 	if (!Object || !Function)
 		return;
+
+	if (bInProcessEventHook)
+	{
+		Object->ProcessEvent(Function, Parameters);
+		return;
+	}
+
+	struct FScope
+	{
+		FScope() { bInProcessEventHook = true; }
+		~FScope() { bInProcessEventHook = false; }
+	};
+
+	{
+	FScope Scope;
 
 	if (IsCreativeGame())
 		LogCreativeProcessEvent(Object, Function);
@@ -238,9 +258,13 @@ static inline void ProcessEventHook(UObject* Object, UFunction* Function, void* 
 			LOG_INFO(LogDev, "Function called: {} with {}", FunctionFullName, ObjectName);
 		}
 	}
+	}
 
 	Object->ProcessEvent(Function, Parameters);
 
 	if (IsCreativeGame())
+	{
+		FScope Scope; // what runs after the function (it may call ProcessEvent itself) is not logged again either
 		CreativeAfterProcessEvent(Object, Function, Parameters);
+	}
 }
