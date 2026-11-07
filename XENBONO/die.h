@@ -38,10 +38,13 @@ static inline void LogCreativeProcessEvent(UObject* Object, UFunction* Function)
 		const bool bServerRequest = Has(":Server") && !Has("ServerMove") && !Has("ServerUpdate") && !Has("ServerTouch") && !Has("ServerAck") && !Has("ServerCheckClient") && !Has("ServerSetSpectator")
 			&& !Has("ServerSendClient") && !Has("ServerNotifyLoaded") && !Has("ServerSetClientTimeStamp") && !Has("ServerCamera") && !Has("ServerRotate") && !Has("ServerPawn");
 
-		const bool bInteresting = bServerRequest || Has("Projectile") || Has("Explod") || Has("Detonat") || (Has("Playset") || Has("Volume") || Has("Grenade") || Has("Minigame") || Has("Creative") || Has("Prefab") || Has("Plot") || Has("Island") || Has("Playspace") || Has("Thermometer") || Has("Throw") || Has("Building:") || Has("BuildingSMActor") || Has("BuildingActor"))
+		const bool bInteresting = bServerRequest || Has("Projectile") || Has("Explod") || Has("Detonat") || (Has("Duplicate") || Has("MoveTool") || Has("Quickbar") || Has("Clipboard") || Has("Playset") || Has("Volume") || Has("Grenade") || Has("Minigame") || Has("Creative") || Has("Prefab") || Has("Plot") || Has("Island") || Has("Playspace") || Has("Thermometer") || Has("Throw") || Has("Building:") || Has("BuildingSMActor") || Has("BuildingActor"))
 			&& !Has("Audio") && !Has("Sound") && !Has("Submix") && !Has("PostProcess") && !Has("Physics") && !Has("LevelStreamingVolume") && !Has("Tick") && !Has("Animation") && !Has("Anim");
 
-		Found = CallsLeft.emplace(Function, bSettings ? 500 : (bInteresting ? 40 : -1)).first;
+		// the copy, cut and move requests and the minigame's calls are what the log is read for: they get a longer allowance than the rest (the 7 Nov log ran out at 40)
+		const bool bMany = Has("MoveTool") || Has("Duplicate") || Has("Cut") || Has("Pickup") || Has("Quickbar") || Has("Clipboard") || Has("Minigame") || Has("SelectedActors");
+
+		Found = CallsLeft.emplace(Function, bSettings ? 500 : (bInteresting ? (bMany ? 300 : 40) : -1)).first;
 	}
 
 	if (Found->second <= 0)

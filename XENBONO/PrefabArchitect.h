@@ -367,7 +367,11 @@ namespace Architect
 
 		// ---- stages
 		void RefineKinds();
-		bool Exhibit();
+				bool Exhibit();
+
+		struct ShelfSpot { double X, Y, R; };
+		std::vector<ShelfSpot> Shelf(std::vector<int> Pieces, double CenterX, double StartY, double Width, double* DepthOut, bool bPlace = true);
+
 		void ChooseGrid();
 		void BuildRing();
 		void Facade();
@@ -408,93 +412,117 @@ namespace Architect
 	}
 
 	// ---------------------------------------------------------------------------------------------------------------------
-	// An exhibit: one row for each kind of piece, left to right, front to back, centred.
+	// Pieces on a shelf: rows by depth (the deepest first, pieces of about the same depth together, then by kind), each row filled left to right up to Width, the rows one
+	// behind the other from StartY on. Returns where every piece went (a circle round it) and, in DepthOut, how deep the shelf is.
+	inline std::vector<Builder::ShelfSpot> Builder::Shelf(std::vector<int> Pieces, double CenterX, double StartY, double Width, double* DepthOut, bool bPlace)
+	{
+		std::vector<ShelfSpot> Spots;
+
+		std::stable_sort(Pieces.begin(), Pieces.end(), [&](int X, int Y) {
+			const long BucketX = (long)(T[X].SY / 64.0), BucketY = (long)(T[Y].SY / 64.0);
+
+			if (BucketX != BucketY)
+				return BucketX > BucketY;
+
+			if (T[X].K != T[Y].K)
+				return (int)T[X].K < (int)T[Y].K;
+
+			return X < Y;
+		});
+
+		struct Row { std::vector<int> Items; double Width = 0; double Depth = 0; };
+		std::vector<Row> Rows;
+		Row Current;
+
+		auto GapOf = [&](int Index) { return (std::max)(T[Index].SX, T[Index].SY) < 220 ? 20.0 : 80.0; }; // small pieces form a tight board
+
+		for (int Index : Pieces)
+		{
+			if (!Current.Items.empty() && Current.Width + GapOf(Index) + T[Index].SX > Width)
+			{
+				Rows.push_back(Current);
+				Current = Row();
+			}
+
+			Current.Width += (Current.Items.empty() ? 0.0 : GapOf(Index)) + T[Index].SX;
+			Current.Depth = (std::max)(Current.Depth, T[Index].SY);
+			Current.Items.push_back(Index);
+		}
+
+		if (!Current.Items.empty())
+			Rows.push_back(Current);
+
+		double Y = StartY;
+
+		for (auto& Row : Rows)
+		{
+			double X = CenterX - Row.Width / 2;
+			bool bFirst = true;
+
+			for (int Index : Row.Items)
+			{
+				if (!bFirst)
+					X += GapOf(Index);
+
+				bFirst = false;
+
+				if (bPlace)
+				{
+					Take(Index);
+					Put(Index, X + T[Index].SX / 2, Y + Row.Depth / 2, 0, 0);
+					Spots.push_back({ X + T[Index].SX / 2, Y + Row.Depth / 2, 0.5 * (std::max)(T[Index].SX, T[Index].SY) });
+				}
+
+				X += T[Index].SX;
+			}
+
+			Y += Row.Depth + ((std::max)(T[Row.Items[0]].SX, T[Row.Items[0]].SY) < 220 ? 20.0 : 100.0);
+		}
+
+		if (DepthOut)
+			*DepthOut = Y - StartY;
+
+		return Spots;
+	}
+
+	// ---------------------------------------------------------------------------------------------------------------------
+	// An exhibit: every piece on a shelf, centred, packed in rows (several kinds share a row), so a gallery of a few pieces of many kinds is a compact board.
 	inline bool Builder::Exhibit()
 	{
 		Out.bExhibit = true;
 
-		std::vector<int> Order;
-
-		for (size_t i = 0; i < T.size(); ++i)
-			if (T[i].Count > 0)
-				Order.push_back((int)i);
-
-		// the same kinds together, big pieces first
-		std::stable_sort(Order.begin(), Order.end(), [&](int X, int Y) {
-			if (T[X].K != T[Y].K)
-				return (int)T[X].K < (int)T[Y].K;
-
-			return T[X].SX * T[X].SY > T[Y].SX * T[Y].SY;
-		});
-
-		// the rows: every class on its own rows, the width of the exhibit grows with the amount of pieces
-		int TotalPieces = 0;
-
-		for (int Index : Order)
-			TotalPieces += T[Index].Count;
-
+		std::vector<int> List;
 		double Area = 0;
 
-		for (int Index : Order)
-			Area += T[Index].Count * (T[Index].SX + 80) * (T[Index].SY + 80);
-
-		const double Width = (std::max)(R.SizeX * R.Tile, (std::min)(std::sqrt(Area) * 1.3, 9000.0));
-
-		// lay the classes out one after another, each starting on a new row
-		double Y = 0;
-		struct Row { std::vector<std::pair<int, double>> Items; double Depth = 0; double Width = 0; };
-		std::vector<Row> Rows;
-
-		for (int Index : Order)
-		{
-			Row Current;
-			int N = Left[Index];
-
-			for (int n = 0; n < N; ++n)
+		for (size_t i = 0; i < T.size(); ++i)
+			for (int n = 0; n < Left[i]; ++n)
 			{
-				const double W = T[Index].SX;
-				const double Gap = (std::max)(T[Index].SX, T[Index].SY) < 220 ? 20.0 : 80.0; // small pieces form a tight board
-
-				if (!Current.Items.empty() && Current.Width + W + Gap > Width)
-				{
-					Rows.push_back(Current);
-					Current = Row();
-				}
-
-				Current.Items.push_back({ Index, W });
-				Current.Width += W + (Current.Items.size() > 1 ? Gap : 0);
-				Current.Depth = (std::max)(Current.Depth, T[Index].SY);
+				List.push_back((int)i);
+				Area += (T[i].SX + 80) * (T[i].SY + 80);
 			}
 
-			Left[Index] = 0;
+		double Width = (std::max)(R.SizeX * R.Tile, (std::min)(std::sqrt(Area) * 1.3, 9000.0));
+		double Depth = 0;
 
-			if (!Current.Items.empty())
-				Rows.push_back(Current);
-		}
-
-		double TotalDepth = 0;
-
-		for (auto& Row : Rows)
-			TotalDepth += Row.Depth + ((std::max)(T[Row.Items[0].first].SX, T[Row.Items[0].first].SY) < 220 ? 20.0 : 100.0);
-
-		Y = -TotalDepth / 2;
-
-		for (auto& Row : Rows)
+		for (int Try = 0; Try < 6; ++Try)
 		{
-			double X = -Row.Width / 2;
+			Shelf(List, 0, 0, Width, &Depth, false);
 
-			for (auto& Item : Row.Items)
-			{
-				const double Gap = (std::max)(T[Item.first].SX, T[Item.first].SY) < 220 ? 20.0 : 80.0;
-				Put(Item.first, X + Item.second / 2, Y + Row.Depth / 2, 0, 0);
-				X += Item.second + Gap;
-			}
+			if (Depth <= 15000.0)
+				break;
 
-			Y += Row.Depth + ((std::max)(T[Row.Items[0].first].SX, T[Row.Items[0].first].SY) < 220 ? 20.0 : 100.0);
+			Width *= 1.5;
 		}
+
+		const size_t First = Out.Items.size();
+		Shelf(List, 0, 0, Width, &Depth);
+
+		// centred in the other direction too
+		for (size_t k = First; k < Out.Items.size(); ++k)
+			Out.Items[k].Y -= Depth / 2;
 
 		Out.Pitch = 512;
-		Note(Fmt("exhibit: %.0f pieces in %.0f rows", (double)TotalPieces, (double)Rows.size()));
+		Note(Fmt("exhibit: %.0f pieces on a shelf %.0f wide", (double)List.size(), Width));
 		return true;
 	}
 
@@ -1548,8 +1576,9 @@ namespace Architect
 	// pile or the building, and the way to the door stays clear.
 	inline void Builder::Props()
 	{
-		std::vector<int> Rest;
-		int LeftOut = 0;
+				std::vector<int> Rest;
+		std::vector<int> Spare; // one entry for each spare structural piece
+		double SpareArea = 0;
 
 		for (size_t i = 0; i < T.size(); ++i)
 		{
@@ -1558,18 +1587,43 @@ namespace Architect
 
 			if (T[i].K != Kind::Prop)
 			{
-				LeftOut += Left[i];
+				for (int n = 0; n < Left[i]; ++n)
+				{
+					Spare.push_back((int)i);
+					SpareArea += (T[i].SX + 80) * (T[i].SY + 80);
+				}
+
 				continue;
 			}
 
 			Rest.push_back((int)i);
 		}
 
-		if (LeftOut > 0)
-			Note(Fmt("%.0f spare structural pieces (walls, roofs, floors ...) were not needed and are left out", (double)LeftOut));
+		// What the building did not need (walls, roofs, floors ... that no slot took) stands on a shelf behind it, so every piece of the prefab is there.
+		std::vector<ShelfSpot> ShelfSpots;
+
+		if (!Spare.empty())
+		{
+			double Wide = (std::max)((std::max)(MaxX - MinX, 4.0 * P), (std::min)(std::sqrt(SpareArea) * 1.3, 9000.0));
+			double Depth = 0;
+
+			for (int Try = 0; Try < 6; ++Try)
+			{
+				Shelf(Spare, (MinX + MaxX) / 2, MaxY + 700.0, Wide, &Depth, false);
+
+				if (Depth <= 15000.0)
+					break;
+
+				Wide *= 1.5;
+			}
+
+			ShelfSpots = Shelf(Spare, (MinX + MaxX) / 2, MaxY + 700.0, Wide, nullptr);
+			Note(Fmt("%.0f spare structural pieces (walls, roofs, floors ...) stand on a shelf behind the building", (double)Spare.size()));
+		}
 
 		if (Rest.empty())
 			return;
+
 
 		// the largest first (the same kind together)
 		std::stable_sort(Rest.begin(), Rest.end(), [&](int X, int Y) {
@@ -1577,8 +1631,12 @@ namespace Architect
 			return AreaX * std::sqrt((double)(std::min)(T[X].Count, 30)) > AreaY * std::sqrt((double)(std::min)(T[Y].Count, 30));
 		});
 
-		struct Circle { double X, Y, R; };
+				struct Circle { double X, Y, R; };
 		std::vector<Circle> Piles;
+
+		for (auto& Spot : ShelfSpots)
+			Piles.push_back({ Spot.X, Spot.Y, Spot.R });
+
 
 		// the way to the door stays clear
 		double Clear = 1.1 * P;

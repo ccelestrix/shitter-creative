@@ -16,6 +16,8 @@
 #include <map>
 #include <set>
 
+static bool FindIslandStart(AFortVolume* Volume, FVector& OutLocation, FRotator& OutRotation);
+
 void AFortAthenaCreativePortal::TeleportPlayerToLinkedVolumeHook(UObject* Context, FFrame& Stack, void* Ret)
 {
 	LOG_INFO(LogCreative, "TeleportPlayerToLinkedVolume called on portal {}", __int64(Context));
@@ -51,11 +53,22 @@ void AFortAthenaCreativePortal::TeleportPlayerToLinkedVolumeHook(UObject* Contex
 		CreativeIsland::CallOnRep(PlayerController, "OnRep_CreativePlotLinkedVolume");
 	}
 
-	auto Location = LinkedVolume->GetActorLocation();
-	Location.Z = 10000; // the island is entered from the sky, like the Xenon server does
-	LOG_INFO(LogCreative, "TeleportPlayerToLinkedVolume: sending the pawn to {} {} {}", Location.X, Location.Y, Location.Z);
 	CreativeIsland::DumpState("before the teleport onto the island");
-	// Location.Z -= 10000; // proper 1:1
+
+	// The island's own player start (a FortPlayerStartCreative inside the island) is where the player lands, as in the game.
+	FVector StartLocation;
+	FRotator StartRotation;
+
+	if (FindIslandStart(LinkedVolume, StartLocation, StartRotation))
+	{
+		LOG_INFO(LogCreative, "TeleportPlayerToLinkedVolume: sending the pawn to the island's player start at {} {} {}", StartLocation.X, StartLocation.Y, StartLocation.Z);
+		PlayerPawn->TeleportTo(StartLocation, StartRotation);
+		return TeleportPlayerToLinkedVolumeOriginal(Context, Stack, Ret);
+	}
+
+	auto Location = LinkedVolume->GetActorLocation();
+	Location.Z = 10000; // no player start on the island: it is entered from the sky, like the Xenon server does
+	LOG_INFO(LogCreative, "TeleportPlayerToLinkedVolume: sending the pawn to {} {} {}", Location.X, Location.Y, Location.Z);
 	PlayerPawn->TeleportTo(Location, FRotator());
 
 	if (auto BeginSkydivingFn = PlayerPawn->FindFunction("BeginSkydiving"))
@@ -3119,6 +3132,69 @@ static void CheckCreativeHud(AFortPlayerControllerAthena* Controller, const char
 	PropDump::DumpObject("Quickbar component", Made, 1, 40);
 }
 
+// The player start of an island: a FortPlayerStartCreative inside the island's volume (the plot's own start, marked bUseAsIslandStart, first; a disabled one never).
+// Returns false when the island has none, and writes down how many exist and how far the nearest is, so the log says why.
+static bool FindIslandStart(AFortVolume* Volume, FVector& OutLocation, FRotator& OutRotation)
+{
+	static auto StartClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStartCreative");
+
+	if (!Volume || !StartClass)
+		return false;
+
+	const auto Center = Volume->GetActorLocation();
+	auto Starts = UGameplayStatics::GetAllActorsOfClass(GetWorld(), StartClass);
+	AActor* Best = nullptr;
+	double BestScore = 0, NearestAny = 1e18;
+	int Inside = 0;
+
+	for (int i = 0; i < Starts.Num(); ++i)
+	{
+		auto Start = Starts.at(i);
+
+		if (!Start)
+			continue;
+
+		const auto At = Start->GetActorLocation();
+		const double Dx = (double)At.X - (double)Center.X, Dy = (double)At.Y - (double)Center.Y;
+		const double Distance = std::sqrt(Dx * Dx + Dy * Dy);
+		NearestAny = (std::min)(NearestAny, Distance);
+
+		if (Distance > 30000.0)
+			continue;
+
+		static auto EnabledOffset = Start->GetOffset("bIsEnabled", false);
+		static auto IslandStartOffset = Start->GetOffset("bUseAsIslandStart", false);
+
+		if (EnabledOffset != -1 && !Start->Get<bool>(EnabledOffset))
+			continue;
+
+		++Inside;
+		const bool bIslandStart = IslandStartOffset != -1 && Start->Get<bool>(IslandStartOffset);
+		const double Score = Distance - (bIslandStart ? 100000.0 : 0.0);
+
+		if (!Best || Score < BestScore)
+		{
+			Best = Start;
+			BestScore = Score;
+		}
+	}
+
+	const int Total = Starts.Num();
+	Starts.Free();
+
+	if (!Best)
+	{
+		LOG_INFO(LogCreative, "Island start: {} FortPlayerStartCreative actors exist, none inside the island at {} {} (the nearest is {:.0f} away)", Total, Center.X, Center.Y, Total ? NearestAny : -1.0);
+		return false;
+	}
+
+	OutLocation = Best->GetActorLocation();
+	OutLocation.Z += 120.f;
+	OutRotation = Best->GetActorRotation();
+	LOG_INFO(LogCreative, "Island start: {} of {} FortPlayerStartCreative actors are inside the island, using {} at {}", Inside, Total, Describe(Best), Where(Best));
+	return true;
+}
+
 struct MapActor
 {
 	UClass* Class = nullptr;
@@ -3966,7 +4042,7 @@ namespace CreativeSettings
 			long long Value;
 
 			if (Index >= 0)
-				Value = Index < (int)Def->Ints.size() ? Def->Ints[Index] : Index;
+				Value = Index < (int)Def->Ints.size() ? Def->Ints[Index] : (Index < (int)Def->Floats.size() ? (long long)Def->Floats[Index] : Index);
 			else if (bNumber)
 				Value = (long long)Number;
 			else
@@ -4016,7 +4092,7 @@ namespace CreativeSettings
 			float Value;
 
 			if (Index >= 0)
-				Value = Index < (int)Def->Floats.size() ? Def->Floats[Index] : (float)Index;
+				Value = Index < (int)Def->Floats.size() ? Def->Floats[Index] : (Index < (int)Def->Ints.size() ? (float)Def->Ints[Index] : (float)Index);
 			else if (bNumber)
 				Value = (float)Number;
 			else
@@ -4091,6 +4167,57 @@ namespace CreativeSettings
 		}
 
 		return Done;
+	}
+
+	// What the game's own setter does after a change: the component's OnAnyPropertyChanged delegate runs the functions bound to it (a billboard draws its new text, the
+	// settings machine pushes its values into the minigame). Setting the properties by hand skips that, so the bound functions are run here.
+	static int NotifyOptionsChanged(UObject* Component, UObject* Owner)
+	{
+		const int Offset = Component ? Component->GetOffset("OnAnyPropertyChanged", false) : -1;
+		int Ran = 0;
+		std::string Names;
+
+		auto Run = [&](UObject* Object, const std::string& Name) {
+			auto Function = Object ? Object->FindFunction(Name) : nullptr;
+
+			if (!Function)
+				return false;
+
+			char Params[0x100] = {};
+			const bool bRan = SafeProcessEvent(Object, Function, Params);
+			Names += std::format("{}{} on {}{}", Names.empty() ? "" : ", ", Name, Object->GetName(), bRan ? "" : " (FAILED)");
+			return bRan;
+		};
+
+		if (Offset > 0 && Readable((char*)Component + Offset, 0x10))
+		{
+			const char* Delegate = (const char*)Component + Offset;
+			const char* Data = *(const char* const*)Delegate;
+			const int Num = *(const int*)(Delegate + 8);
+
+			// FMulticastScriptDelegate: a TArray of FScriptDelegate (weak object pointer, function name), 16 bytes each
+			if (Num > 0 && Num <= 64 && Readable(Data, (size_t)Num * 16))
+				for (int i = 0; i < Num; ++i)
+				{
+					const char* Entry = Data + (size_t)i * 16;
+					UObject* Bound = ((FWeakObjectPtr*)Entry)->Get();
+
+					if (!PropDump::IsLiveObject(Bound))
+						Bound = Owner;
+
+					if (Run(Bound, NameAt(Entry + 8)))
+						++Ran;
+				}
+		}
+
+		// nothing was bound that could be found: the update functions the SDK lists for these devices
+		if (Ran == 0)
+			for (const char* Name : { "OnGameSettingsUpdated", "UpdateGameSettings", "UpdateProperties" })
+				if (Run(Owner, Name))
+					++Ran;
+
+		LOG_INFO(LogCreative, "Settings:   told {} that its options changed: {}", Describe(Owner), Names.empty() ? std::string("no bound function ran") : Names);
+		return Ran;
 	}
 
 	// The actor's properties set by hand (and told about it), the override list updated. Returns how many options were set.
@@ -4212,6 +4339,9 @@ namespace CreativeSettings
 			LOG_WARN(LogCreative, "Settings:   the component did not take {} option(s){}, setting the actor's properties directly", (int)Missing.size(), bRepaired ? " (even with a base object)" : "");
 			const int Direct = ApplyToActor(R.Target, Component, Missing);
 			LOG_INFO(LogCreative, "Settings:   {} of {} option(s) set on the actor", Direct, (int)Missing.size());
+
+			if (Direct > 0)
+				NotifyOptionsChanged(Component, R.Target);
 		}
 
 		if (CurrentOptions(Component, Now))
@@ -5325,10 +5455,19 @@ namespace CreativeMinigame
 
 			LOG_INFO(LogCreative, "Minigame driver: OnPlayerPawnPossessedDuringTransition for {}: the pawn {} ({} -> {})", Describe(Pawn), bMoved ? "was moved by the game" : "was not moved", BeforeText, Where(Pawn));
 
-			// If the game left the pawn where it was and the island has a Player Start plate, the pawn goes to the plate.
+			// If the game left the pawn where it was, the minigame is asked where this player spawns (its own choice between spawn pads, sky and current location), then the plate.
 			if (!bMoved)
 			{
-				if (auto Plate = NearestStartPlate(Pawn))
+				struct { UObject* PlayerState; FVector Location; FRotator Rotation; bool bOnGround; bool ReturnValue; } Spawn{ Player->GetPlayerState(), FVector(), FRotator(), false, false };
+				const bool bAsked = Call(Minigame, "DetermineSpawnLocation", &Spawn);
+				LOG_INFO(LogCreative, "Minigame driver: DetermineSpawnLocation for {}: {} ({} {} {})", Describe(Pawn), bAsked ? (Spawn.ReturnValue ? "a location" : "no location") : "not available", Spawn.Location.X, Spawn.Location.Y, Spawn.Location.Z);
+
+				if (bAsked && Spawn.ReturnValue && (Spawn.Location.X != 0.f || Spawn.Location.Y != 0.f))
+				{
+					Pawn->TeleportTo(Spawn.Location, Spawn.Rotation);
+					LOG_INFO(LogCreative, "Minigame driver: moved {} to the minigame's spawn location {}", Describe(Pawn), Where(Pawn));
+				}
+				else if (auto Plate = NearestStartPlate(Pawn))
 				{
 					auto Location = Plate->GetActorLocation();
 					Location.Z += 150;
