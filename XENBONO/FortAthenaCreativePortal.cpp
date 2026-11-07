@@ -193,6 +193,7 @@ struct PhoneKick
 
 static std::map<UObject*, PhoneKick> PhoneKicks;
 static void CheckCreativeHud(AFortPlayerControllerAthena* Controller, const char* When, bool bFix);
+static void GrantQuickbarCards(AFortPlayerControllerAthena* Controller, const char* When);
 
 static UFortItemDefinition* CreativePhoneItem()
 {
@@ -246,6 +247,7 @@ static void TickPhone()
 			LOG_INFO(LogCreative, "Creative phone for {}: {} in the inventory ({}), telling the client again (attempt {})", Controller->GetName(), bHas ? "it is" : "it is NOT", bHad ? "it was already" : "it was put there now",
 				It->second.Attempt);
 			CheckCreativeHud(Controller, "phone kick", true);
+			GrantQuickbarCards(Controller, "phone kick");
 			CreativeIsland::CallOnRep(Controller, "ClientCreativePhoneCreated");
 
 			if (--It->second.Left <= 0)
@@ -280,6 +282,7 @@ void CreativeIsland::GiveCreativePhone(AFortPlayerControllerAthena* Controller)
 
 	LOG_INFO(LogCreative, "Gave {} the creative phone ({}, now {})", Controller->GetName(), bHad ? "it had it already" : "it did not have it", bHas ? "in the inventory" : "NOT in the inventory");
 	CheckCreativeHud(Controller, "phone granted", true);
+	GrantQuickbarCards(Controller, "phone granted");
 	CallOnRep(Controller, "ClientCreativePhoneCreated");
 
 	// told again 1.5 s, 5 s, 8.5 s and 12 s later (the first call comes before the client has the item)
@@ -3132,6 +3135,63 @@ static void CheckCreativeHud(AFortPlayerControllerAthena* Controller, const char
 	PropDump::DumpObject("Quickbar component", Made, 1, 40);
 }
 
+// The cards. The phone's creative quickbar has five slots for copied or cut props (a "card" each). The SDK shows the quickbar component holds their item definitions
+// (QuickbarSlotItemDefinitions, FortCreativeUserPrefabItemDefinition) and that a copy asks the server to put the selection into one of them (ServerAddToQuickBar); a slot
+// is an item of the player's inventory (an item entry has a state, CreativeUserPrefabHasContent, for when it holds a copy). Nothing here ever gave a player those items,
+// and the 7 Nov log has no ServerAddToQuickBar at all (the move tool's duplicate request arrived 5 times, the quickbar's never): the client finds no slot to copy
+// into and never asks the server.
+static void GrantQuickbarCards(AFortPlayerControllerAthena* Controller, const char* When)
+{
+	auto Quickbar = QuickbarOf(Controller);
+	auto Inventory = Controller ? Controller->GetWorldInventory() : nullptr;
+
+	if (!Quickbar || !Inventory)
+	{
+		LOG_INFO(LogCreative, "Cards ({}): {} has no quickbar component or no inventory yet", When, Controller ? Controller->GetName() : std::string("null"));
+		return;
+	}
+
+	const int Offset = Quickbar->GetOffset("QuickbarSlotItemDefinitions", false);
+
+	if (Offset <= 0 || !Readable((char*)Quickbar + Offset, 16))
+	{
+		LOG_WARN(LogCreative, "Cards ({}): the quickbar component has no readable slot list", When);
+		return;
+	}
+
+	auto& Slots = Quickbar->Get<TArray<UObject*>>(Offset);
+	int Added = 0, Had = 0;
+	bool bUpdate = false;
+	std::string Names;
+
+	for (int i = 0; i < Slots.Num() && i < 16; ++i)
+	{
+		auto Definition = Slots.at(i);
+
+		if (!Definition || !PropDump::IsLiveObject(Definition))
+			continue;
+
+		auto ItemDefinition = (UFortItemDefinition*)Definition;
+
+		if (Inventory->FindItemInstance(ItemDefinition))
+		{
+			++Had;
+			continue;
+		}
+
+		bool bShouldUpdate = false;
+		Inventory->AddItem(ItemDefinition, &bShouldUpdate, 1);
+		bUpdate = bUpdate || bShouldUpdate;
+		++Added;
+		Names += std::string(Names.empty() ? "" : ", ") + Definition->GetName();
+	}
+
+	if (bUpdate)
+		Inventory->Update(true);
+
+	LOG_INFO(LogCreative, "Cards ({}): {} slot item(s) were already in the inventory of {}, {} put there{}{}", When, Had, Controller->GetName(), Added, Added ? ": " : "", Names);
+}
+
 // Where a player starts on an island. The 117 FortPlayerStartCreative actors of the world are the hub's (the lobby island floats above the plots: the 7 Nov log picked one
 // at Z 26064 for an island whose ground is at about 1990), so a start counts only at the height of the island (within 4000 of its ground). With none, the player
 // stands on the ground in the middle of the island (a downward trace from above it); the sky drop is the last resort. The log says what was found.
@@ -4197,6 +4257,296 @@ namespace CreativeSettings
 		return Done;
 	}
 
+	// The override list of an options component as it is stored (scope, name, value as text), "Scope:Name" for the scoped ones.
+	static std::vector<Option> RawOverrides(UObject* Component)
+	{
+		std::vector<Option> Result;
+		const char* Data = DataOf(Component);
+
+		if (!Data)
+			return Result;
+
+		const char* Elements = *(const char* const*)Data;
+		const int Num = *(const int*)(Data + 8);
+
+		if (Num <= 0 || Num > 5000 || !Readable(Elements, (size_t)Num * 0x48))
+			return Result;
+
+		for (int i = 0; i < Num; ++i)
+		{
+			const char* Entry = Elements + (size_t)i * 0x48;
+			const std::string Scope = TextOf(*(const FString*)Entry);
+			const std::string Name = TextOf(*(const FString*)(Entry + 0x10));
+			Result.push_back({ Scope.empty() ? Name : Scope + ":" + Name, TextOf(*(const FString*)(Entry + 0x20)) });
+		}
+
+		return Result;
+	}
+
+	// Entries (scope, name, value as text) written into a FPropertyOverrideData at Data: changed in place or added. With bSplitScope a key "Scope:Name" goes into the
+	// two fields (the island's mutator list keys its settings that way: FortPlayerZoneSettingsComponent:TimeOfDayOverride).
+	static int MirrorIntoData(char* Data, const std::vector<Option>& Values, bool bSplitScope)
+	{
+		if (!Data)
+			return 0;
+
+		int Done = 0;
+
+		for (auto& V : Values)
+		{
+			std::string Scope, Name = V.Key;
+
+			if (bSplitScope)
+			{
+				const auto Colon = V.Key.find(':');
+
+				if (Colon != std::string::npos)
+				{
+					Scope = V.Key.substr(0, Colon);
+					Name = V.Key.substr(Colon + 1);
+				}
+			}
+
+			char*& Elements = *(char**)Data;
+			int& Num = *(int*)(Data + 8);
+			int& Max = *(int*)(Data + 12);
+
+			if (Num < 0 || Num > 5000 || (Num > 0 && !Readable(Elements, (size_t)Num * 0x48)))
+				return Done;
+
+			bool bFound = false;
+
+			for (int i = 0; i < Num && !bFound; ++i)
+				if (TextOf(*(const FString*)(Elements + (size_t)i * 0x48 + 0x10)) == Name && (!bSplitScope || TextOf(*(const FString*)(Elements + (size_t)i * 0x48)) == Scope))
+				{
+					MakeString(Elements + (size_t)i * 0x48 + 0x20, V.Value);
+					bFound = true;
+				}
+
+			if (!bFound)
+			{
+				Elements = (char*)FMemory::Realloc(Num > 0 ? Elements : nullptr, (size_t)(Num + 1) * 0x48, 0);
+				char* Entry = Elements + (size_t)Num * 0x48;
+				memset(Entry, 0, 0x48);
+
+				if (!Scope.empty())
+					MakeString(Entry, Scope);
+
+				MakeString(Entry + 0x10, Name);
+				MakeString(Entry + 0x20, V.Value);
+				++Num;
+				Max = Num;
+			}
+
+			++Done;
+		}
+
+		return Done;
+	}
+
+	// The settings machine's blueprint pushes the options into the minigame when they change (OnGameSettingsUpdated). In the 7 Nov log it left the minigame with a time
+	// limit of 5 (seconds: the game ended 5 s after it began) where the player had chosen 5 minutes (the screen sends the choice's name, "5"; the table behind it says 300),
+	// and with a warm-up of 0 where it had been 3: the state went from Warmup to InProgress in 2 ms, so no countdown and no start screen. What the player chose is read back
+	// from the machine's list and written into the minigame when a game begins; a countdown the player never touched is not "Off".
+	static void EnforceMachineSettings(UObject* Minigame)
+	{
+		auto Machine = SettingsMachine();
+		auto Component = OptionsComponentOf(Machine);
+
+		if (!Minigame || !Component)
+			return;
+
+		static const int AssetOffset = Component->GetOffset("PlayerOptions", false);
+		const auto Defs = ReadOptionDefs(AssetOffset > 0 ? Component->Get<UObject*>(AssetOffset) : nullptr);
+		const auto Held = RawOverrides(Component);
+
+		auto Chosen = [&](const char* Key, std::string& Value) {
+			for (auto& H : Held)
+				if (H.Key == Key)
+				{
+					Value = H.Value;
+					return true;
+				}
+
+			return false;
+		};
+
+		// the number a choice stands for: from the option's table (seconds ...), else the text read as a number
+		auto NumberOf = [&](const OptionDef* Def, const std::string& Value, double& Out) {
+			if (Def)
+			{
+				const int Index = ValueIndex(*Def, Value);
+
+				if (Index >= 0 && Index < (int)Def->Floats.size())
+				{
+					Out = (double)Def->Floats[Index];
+					return true;
+				}
+
+				if (Index >= 0 && Index < (int)Def->Ints.size())
+				{
+					Out = (double)Def->Ints[Index];
+					return true;
+				}
+			}
+
+			return ParseNumber(Value, Out);
+		};
+
+		auto Set = [&](const char* Property, double Seconds, const char* Why) {
+			const int Offset = Minigame->GetOffset(Property, false);
+
+			if (Offset <= 0 || !Readable((char*)Minigame + Offset, 4))
+				return;
+
+			float& Field = Minigame->Get<float>(Offset);
+
+			if (std::fabs(Field - (float)Seconds) < 0.01f)
+				return;
+
+			LOG_INFO(LogCreative, "Settings: {} of {} was {}, now {} ({})", Property, Minigame->GetName(), Field, Seconds, Why);
+			Field = (float)Seconds;
+		};
+
+		double Number = 0;
+		std::string Value;
+
+		if (Chosen("StartCountdownDuration", Value) && NumberOf(FindDef(Defs, "StartCountdownDuration"), Value, Number))
+			Set("WarmupDuration", Number, "the start countdown the player chose");
+		else
+		{
+			const int Offset = Minigame->GetOffset("WarmupDuration", false);
+
+			if (Offset > 0 && Readable((char*)Minigame + Offset, 4) && Minigame->Get<float>(Offset) <= 0.f)
+				Set("WarmupDuration", 3.0, "the start countdown was never chosen, so not Off");
+		}
+
+		if (Chosen("TimeLimit", Value) && NumberOf(FindDef(Defs, "TimeLimit"), Value, Number))
+			Set("TimeLimit", Number, "the time limit the player chose");
+	}
+
+	// What the options screen needs to show a device: an entry for every option in its list. A device that was just placed has none (0 overrides in the log), and the
+	// client's screen has nothing to put in its rows ("[Parameter name]", "Option"). Every option the device has a property for gets an entry holding the property's
+	// value, written the way the screen writes it itself (the name of the choice, True / False, the number or the text).
+	static int MirrorDeviceOptions(UObject* Actor, UObject* Component)
+	{
+		static const int AssetOffset = Component->GetOffset("PlayerOptions", false);
+		const auto Defs = ReadOptionDefs(AssetOffset > 0 ? Component->Get<UObject*>(AssetOffset) : nullptr);
+		const auto Held = RawOverrides(Component);
+		std::vector<Option> Values;
+
+		for (auto& Def : Defs)
+		{
+			if (Def.Key.empty())
+				continue;
+
+			bool bHave = false;
+
+			for (auto& H : Held)
+				bHave = bHave || H.Key == Def.Key;
+
+			if (bHave)
+				continue;
+
+			auto Property = (const char*)Actor->GetProperty(Def.Key, false);
+
+			if (!Property)
+				continue;
+
+			const std::string Type = PropDump::TypeOf(Property);
+			const int Offset = *(const int*)(Property + Offsets::Offset_Internal);
+			const int Size = *(const int*)(Property + PropDump::ElementSizeAt);
+			const char* Address = (const char*)Actor + Offset;
+
+			if (Offset <= 0 || Size <= 0 || !Readable(Address, (size_t)Size))
+				continue;
+
+			std::string Text;
+
+			if (Type == "BoolProperty")
+			{
+				Text = Actor->ReadBitfieldValue(Offset, GetFieldMask((void*)Property)) ? "True" : "False";
+			}
+			else if (Type == "StrProperty")
+			{
+				Text = TextOf(*(const FString*)Address);
+
+				if (Text.empty())
+					continue;
+			}
+			else if (!Def.Values.empty())
+			{
+				int Index = -1;
+
+				if (Type == "IntProperty")
+				{
+					const int V = *(const int*)Address;
+
+					if (!Def.Ints.empty())
+					{
+						for (size_t i = 0; i < Def.Ints.size() && Index < 0; ++i)
+							if (Def.Ints[i] == V)
+								Index = (int)i;
+					}
+					else if (V >= 0 && V < (int)Def.Values.size())
+						Index = V;
+				}
+				else if (Type == "FloatProperty")
+				{
+					const float V = *(const float*)Address;
+
+					for (size_t i = 0; i < Def.Floats.size() && Index < 0; ++i)
+						if (std::fabs(Def.Floats[i] - V) < 0.001f)
+							Index = (int)i;
+
+					for (size_t i = 0; i < Def.Ints.size() && Index < 0; ++i)
+						if (std::fabs((float)Def.Ints[i] - V) < 0.001f)
+							Index = (int)i;
+				}
+				else if (Type == "ByteProperty" || Type == "EnumProperty")
+				{
+					const int V = *(const unsigned char*)Address;
+
+					if (V < (int)Def.Values.size())
+						Index = V;
+				}
+				else if (Type == "StructProperty" && Size == 16)
+				{
+					for (size_t i = 0; i < Def.Colors.size() && Index < 0; ++i)
+						if (memcmp(&Def.Colors[i], Address, 16) == 0)
+							Index = (int)i;
+				}
+
+				if (Index < 0 || Index >= (int)Def.Values.size())
+					continue;
+
+				Text = Def.Values[Index].Name;
+			}
+			else if (Type == "IntProperty")
+				Text = std::to_string(*(const int*)Address);
+			else if (Type == "FloatProperty")
+				Text = std::format("{}", *(const float*)Address);
+			else
+				continue;
+
+			Values.push_back({ Def.Key, Text });
+		}
+
+		if (Values.empty())
+			return 0;
+
+		const int Done = MirrorToData(Component, Values);
+		DataState State;
+
+		if (ReadData(Component, State) && State.Base)
+			if (auto OnRep = Component->FindFunction("OnRep_PlayerOptionData"))
+				SafeProcessEvent(Component, OnRep, nullptr);
+
+		((AActor*)Actor)->ForceNetUpdate();
+		LOG_INFO(LogCreative, "Device options: {} got {} value(s) in its option list ({} options in the asset, {} were held): {}", Describe(Actor), Done, (int)Defs.size(), (int)Held.size(), Summary(Values, 30));
+		return Done;
+	}
+
 	// What the game's own setter does after a change: the component's OnAnyPropertyChanged delegate runs the functions bound to it (a billboard draws its new text, the
 	// settings machine pushes its values into the minigame). Setting the properties by hand skips that, so the bound functions are run here.
 	static int NotifyOptionsChanged(UObject* Component, UObject* Owner)
@@ -4535,6 +4885,38 @@ namespace CreativeSettings
 			Actor->ForceNetUpdate();
 	}
 
+		// Where the replicated overrides live: the game state's ReplOverrideData (an AFortPropertyOverrideReplShared with the fast array the clients read the shared option
+	// values from). Written down once, to see whether the game state has one at all.
+	static void LogOverrideReplication()
+	{
+		static bool bDone = false;
+
+		if (bDone)
+			return;
+
+		bDone = true;
+		auto GameState = (UObject*)GetWorld()->GetGameState();
+		const int Offset = GameState ? GameState->GetOffset("ReplOverrideData", false) : -1;
+
+		if (Offset <= 0 || !Readable((char*)GameState + Offset, 8))
+		{
+			LOG_INFO(LogCreative, "Settings: the game state {} has no ReplOverrideData property", GameState ? Describe(GameState) : std::string("(none)"));
+			return;
+		}
+
+		auto Shared = GameState->Get<UObject*>(Offset);
+		std::string Text = "null";
+
+		if (Shared && PropDump::IsLiveObject(Shared))
+		{
+			const int Repl = Shared->GetOffset("ReplOverrides", false);
+			const int Count = Repl > 0 && Readable((char*)Shared + Repl + 0x118, 16) ? *(int*)((char*)Shared + Repl + 0x118 + 8) : -1;
+			Text = std::format("{} with {} replicated override(s)", Describe(Shared), Count);
+		}
+
+		LOG_INFO(LogCreative, "Settings: the game state's ReplOverrideData is {}", Text);
+	}
+
 	// The island's mutator list (the volume's FortMutatorListComponent, "CreativeIslandMutatorList"): what the settings tab's gameplay options (time of day, light, fog,
 	// starting health, shields ...) are stored in. Their keys are "ClassOfTheSetting:Property", and the mutators listen to the list.
 	static UObject* MutatorListOf(UObject* Controller)
@@ -4620,6 +5002,19 @@ namespace CreativeSettings
 			}
 		}
 
+		if (!bHeld)
+		{
+			// the list's own functions took nothing (it still holds 0 after them): the entries go into its override array directly, scope and name apart
+			const int ArrayOffset = List->GetOffset("PropertyOverrideArray", false);
+			char* ArrayData = ArrayOffset > 0 && Readable((char*)List + ArrayOffset, 0x50) ? (char*)List + ArrayOffset : nullptr;
+			const int Written = MirrorIntoData(ArrayData, Wanted, true);
+			std::vector<Option> After;
+			const bool bRead = ListOverrides(List, After);
+			LOG_INFO(LogCreative, "Settings:   {} entr{} written into the mutator list's own override array; it reads back {} option(s), {} of the {} wanted among them: {}", Written, Written == 1 ? "y" : "ies",
+				bRead ? (int)After.size() : -1, Matching(Wanted, After), (int)Wanted.size(), Summary(After, 8));
+			bHeld = Written > 0;
+		}
+
 		if (auto Resolve = List->FindFunction("ResolvePendingRepOverrides"))
 			SafeProcessEvent(List, Resolve, nullptr);
 
@@ -4639,6 +5034,7 @@ namespace CreativeSettings
 
 		if (!bAfter)
 		{
+			LogOverrideReplication();
 			std::vector<Option> Before;
 			const bool bRead = ListOverrides(List, Before);
 			LOG_INFO(LogCreative, "Settings: {} asks to change {} game option(s); the island's mutator list is {} ({} option(s) held before): {}", Describe(Controller), (int)Wanted.size(), List ? Describe(List) : std::string("NOT FOUND"),
@@ -4828,6 +5224,7 @@ namespace CreativeSettings
 			LOG_INFO(LogCreative, "Device check:   options asset {}, {} option(s) set: {}", Describe(OptionsAssetOffset == -1 ? nullptr : Component->Get<UObject*>(OptionsAssetOffset)), (int)Set.size(), Summary(Set, 8));
 			LogComponent("when placed", Component);
 			ApplyDefaultOptions(Device, Component);
+			MirrorDeviceOptions(Device, Component);
 			LogEditAccess(Component, ControllerPawn(BuilderController));
 		}
 
@@ -5881,6 +6278,9 @@ namespace CreativeMinigame
 			if (State == InProgress) { D.bLimitCalled = false; D.bEndCalled = false; }
 			if (State == PostGameReset) D.bResetDone = false;
 			if (State == PreGame) D.bStartedHandled = false;
+
+			if (State == Transitioning || State == WaitingForCameras || State == Warmup)
+				CreativeSettings::EnforceMachineSettings(Minigame);
 		}
 
 		const ULONGLONG Elapsed = Now - D.Since;
