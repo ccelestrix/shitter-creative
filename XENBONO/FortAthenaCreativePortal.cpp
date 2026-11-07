@@ -3132,66 +3132,86 @@ static void CheckCreativeHud(AFortPlayerControllerAthena* Controller, const char
 	PropDump::DumpObject("Quickbar component", Made, 1, 40);
 }
 
-// The player start of an island: a FortPlayerStartCreative inside the island's volume (the plot's own start, marked bUseAsIslandStart, first; a disabled one never).
-// Returns false when the island has none, and writes down how many exist and how far the nearest is, so the log says why.
+// Where a player starts on an island. The 117 FortPlayerStartCreative actors of the world are the hub's (the lobby island floats above the plots: the 7 Nov log picked one
+// at Z 26064 for an island whose ground is at about 1990), so a start counts only at the height of the island (within 4000 of its ground). With none, the player
+// stands on the ground in the middle of the island (a downward trace from above it); the sky drop is the last resort. The log says what was found.
 static bool FindIslandStart(AFortVolume* Volume, FVector& OutLocation, FRotator& OutRotation)
 {
 	static auto StartClass = FindObject<UClass>(L"/Script/FortniteGame.FortPlayerStartCreative");
 
-	if (!Volume || !StartClass)
+	if (!Volume)
 		return false;
 
 	const auto Center = Volume->GetActorLocation();
-	auto Starts = UGameplayStatics::GetAllActorsOfClass(GetWorld(), StartClass);
+	double GroundZ = 0;
+	const bool bGround = TraceDown((double)Center.X, (double)Center.Y, (double)Center.Z + 13000.0, (double)Center.Z - 2000.0, false, GroundZ); // from 13000 above the volume's origin (the island's ground is 6000 above it)
+
 	AActor* Best = nullptr;
-	double BestScore = 0, NearestAny = 1e18;
-	int Inside = 0;
+	double BestScore = 0;
+	int Total = 0, Near = 0, Inside = 0;
 
-	for (int i = 0; i < Starts.Num(); ++i)
+	if (StartClass)
 	{
-		auto Start = Starts.at(i);
+		auto Starts = UGameplayStatics::GetAllActorsOfClass(GetWorld(), StartClass);
+		Total = Starts.Num();
 
-		if (!Start)
-			continue;
-
-		const auto At = Start->GetActorLocation();
-		const double Dx = (double)At.X - (double)Center.X, Dy = (double)At.Y - (double)Center.Y;
-		const double Distance = std::sqrt(Dx * Dx + Dy * Dy);
-		NearestAny = (std::min)(NearestAny, Distance);
-
-		if (Distance > 30000.0)
-			continue;
-
-		static auto EnabledOffset = Start->GetOffset("bIsEnabled", false);
-		static auto IslandStartOffset = Start->GetOffset("bUseAsIslandStart", false);
-
-		if (EnabledOffset != -1 && !Start->Get<bool>(EnabledOffset))
-			continue;
-
-		++Inside;
-		const bool bIslandStart = IslandStartOffset != -1 && Start->Get<bool>(IslandStartOffset);
-		const double Score = Distance - (bIslandStart ? 100000.0 : 0.0);
-
-		if (!Best || Score < BestScore)
+		for (int i = 0; i < Starts.Num(); ++i)
 		{
-			Best = Start;
-			BestScore = Score;
+			auto Start = Starts.at(i);
+
+			if (!Start)
+				continue;
+
+			const auto At = Start->GetActorLocation();
+			const double Dx = (double)At.X - (double)Center.X, Dy = (double)At.Y - (double)Center.Y;
+			const double Distance = std::sqrt(Dx * Dx + Dy * Dy);
+
+			if (Distance > 30000.0)
+				continue;
+
+			++Near;
+
+			// at the height of the island
+			if (bGround && std::fabs((double)At.Z - GroundZ) > 4000.0)
+				continue;
+
+			static auto EnabledOffset = Start->GetOffset("bIsEnabled", false);
+			static auto IslandStartOffset = Start->GetOffset("bUseAsIslandStart", false);
+
+			if (EnabledOffset != -1 && !Start->Get<bool>(EnabledOffset))
+				continue;
+
+			++Inside;
+			const bool bIslandStart = IslandStartOffset != -1 && Start->Get<bool>(IslandStartOffset);
+			const double Score = Distance - (bIslandStart ? 100000.0 : 0.0);
+
+			if (!Best || Score < BestScore)
+			{
+				Best = Start;
+				BestScore = Score;
+			}
 		}
+
+		Starts.Free();
 	}
 
-	const int Total = Starts.Num();
-	Starts.Free();
-
-	if (!Best)
+	if (Best)
 	{
-		LOG_INFO(LogCreative, "Island start: {} FortPlayerStartCreative actors exist, none inside the island at {} {} (the nearest is {:.0f} away)", Total, Center.X, Center.Y, Total ? NearestAny : -1.0);
-		return false;
+		OutLocation = Best->GetActorLocation();
+		OutLocation.Z += 120.f;
+		OutRotation = Best->GetActorRotation();
+		LOG_INFO(LogCreative, "Island start: {} of {} FortPlayerStartCreative actors are at the island's height ({} within reach), using {} at {}", Inside, Total, Near, Describe(Best), Where(Best));
+		return true;
 	}
 
-	OutLocation = Best->GetActorLocation();
-	OutLocation.Z += 120.f;
-	OutRotation = Best->GetActorRotation();
-	LOG_INFO(LogCreative, "Island start: {} of {} FortPlayerStartCreative actors are inside the island, using {} at {}", Inside, Total, Describe(Best), Where(Best));
+	LOG_INFO(LogCreative, "Island start: {} FortPlayerStartCreative actors exist, {} within 30000 of the island at {} {}, none at its height (ground {})", Total, Near, Center.X, Center.Y, bGround ? std::format("{:.0f}", GroundZ) : std::string("not found"));
+
+	if (!bGround)
+		return false;
+
+	OutLocation = FVector(Center.X, Center.Y, (float)GroundZ + 150.f);
+	OutRotation = FRotator();
+	LOG_INFO(LogCreative, "Island start: the player stands on the ground in the middle of the island, at {:.0f} {:.0f} {:.0f}", (double)OutLocation.X, (double)OutLocation.Y, (double)OutLocation.Z);
 	return true;
 }
 
@@ -3449,7 +3469,7 @@ static std::vector<MapActor> ReadDeviceMap(const std::string& Device)
 // ---------------------------------------------------------------------------------------------------------------------
 namespace CreativeSettings
 {
-	enum { None = 0, ActorOptions, GameplayOptions, ItemListOptions, MessageComponents, GameDescription, Interact, DeviceButton, KindCount };
+	enum { None = 0, ActorOptions, GameplayOptions, ItemListOptions, MessageComponents, GameDescription, Interact, DeviceButton, MoveDuplicate, MoveCut, MoveSpawn, KindCount };
 
 	struct Option
 	{
@@ -3466,7 +3486,11 @@ namespace CreativeSettings
 			Functions[MessageComponents] = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.ServerUpdateMessageComponents");
 			Functions[GameDescription] = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.ServerUpdateGameDescriptionData");
 			Functions[Interact] = FindObject<UFunction>(L"/Script/FortniteGame.FortControllerComponent_Interaction.ServerAttemptInteract");
-			Functions[DeviceButton] = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.ServerBroadcastDeviceButtonComponentClickedDelegate");
+						Functions[DeviceButton] = FindObject<UFunction>(L"/Script/FortniteGame.FortPlayerController.ServerBroadcastDeviceButtonComponentClickedDelegate");
+			Functions[MoveDuplicate] = FindObject<UFunction>(L"/Script/FortniteGame.FortCreativeMoveTool.ServerDuplicateStartInteracting");
+			Functions[MoveCut] = FindObject<UFunction>(L"/Script/FortniteGame.FortCreativeMoveTool.ServerHandshakeFromClientForReceivingCutActors");
+			Functions[MoveSpawn] = FindObject<UFunction>(L"/Script/FortniteGame.FortCreativeMoveTool.ServerSpawnSelectedActorsWithTransform");
+
 			return true;
 		}();
 
@@ -3738,6 +3762,7 @@ namespace CreativeSettings
 		std::vector<long long> Ints;
 		std::vector<Color4> Colors;
 		std::vector<float> Floats;
+		int DefaultIndex = -1; // the choice an option starts with (the choice options have one at +0xF8)
 	};
 
 	static std::string Lower(std::string Text)
@@ -3799,6 +3824,9 @@ namespace CreativeSettings
 			else if (Def.Class == "PlaylistUserOptionIntEnum") Stride = 0x30;
 			else if (Def.Class == "PlaylistUserOptionColorEnum") Stride = 0x38;
 			else if (Def.Class == "PlaylistUserOptionFloatEnum") Stride = 0x48;
+
+			if (Stride && Readable(O + 0xF8, 4))
+				Def.DefaultIndex = *(const int*)(O + 0xF8);
 
 			if (Stride && Readable(O + 0xE8, 0x10))
 			{
@@ -4263,7 +4291,149 @@ namespace CreativeSettings
 		return (int)Applied.size();
 	}
 
+	static UObject* MutatorListOf(UObject* Controller);
+	static bool ApplyToMutatorList(UObject* List, const std::vector<Option>& Wanted);
+
+	// A device starts with the values its blueprint was made with, which need not be among the values its options offer: the billboard's TextSize starts at 0 and its
+	// options are 10, 12, 18 and 24, and the client's options screen cannot show a row whose current value is none of the choices ("[Parameter name]", "Option").
+	// In the game the options component sets every option to its default when the device begins; here, every choice option whose property holds a value that is
+	// not one of its choices is set to the option's default choice.
+	static int ApplyDefaultOptions(UObject* Actor, UObject* Component)
+	{
+		static const int AssetOffset = Component->GetOffset("PlayerOptions", false);
+		const auto Defs = ReadOptionDefs(AssetOffset > 0 ? Component->Get<UObject*>(AssetOffset) : nullptr);
+		int Changed = 0;
+
+		for (auto& Def : Defs)
+		{
+			if (Def.Values.empty() || Def.DefaultIndex < 0 || Def.DefaultIndex >= (int)Def.Values.size())
+				continue;
+
+			auto Property = (const char*)Actor->GetProperty(Def.Key, false);
+
+			if (!Property)
+				continue;
+
+			const std::string Type = PropDump::TypeOf(Property);
+			const int Offset = *(const int*)(Property + Offsets::Offset_Internal);
+			const int Size = *(const int*)(Property + PropDump::ElementSizeAt);
+			const char* Address = (const char*)Actor + Offset;
+
+			if (Offset <= 0 || Size <= 0 || !Readable(Address, (size_t)Size))
+				continue;
+
+			bool bValid = false;
+			std::string Current;
+
+			if (Type == "IntProperty")
+			{
+				const int Value = *(const int*)Address;
+				Current = std::to_string(Value);
+
+				if (!Def.Ints.empty())
+				{
+					for (auto Choice : Def.Ints)
+						bValid = bValid || Choice == Value;
+				}
+				else
+					bValid = Value >= 0 && Value < (int)Def.Values.size();
+			}
+			else if (Type == "FloatProperty")
+			{
+				const float Value = *(const float*)Address;
+				Current = std::to_string(Value);
+
+				for (auto Choice : Def.Floats)
+					bValid = bValid || std::fabs(Choice - Value) < 0.001f;
+
+				for (auto Choice : Def.Ints)
+					bValid = bValid || std::fabs((float)Choice - Value) < 0.001f;
+
+				if (Def.Floats.empty() && Def.Ints.empty())
+					bValid = true; // an enum of names: nothing to compare with
+			}
+			else if (Type == "ByteProperty" || Type == "EnumProperty")
+			{
+				const int Value = *(const unsigned char*)Address;
+				Current = std::to_string(Value);
+				bValid = Value < (int)Def.Values.size();
+			}
+			else if (Type == "StructProperty" && Size == 16 && !Def.Colors.empty())
+			{
+				for (auto& Choice : Def.Colors)
+					bValid = bValid || memcmp(&Choice, Address, 16) == 0;
+
+				Current = "a color";
+			}
+			else
+				continue;
+
+			if (bValid)
+				continue;
+
+			std::string Why;
+			const auto What = SetActorProperty(Actor, &Def, Option{ Def.Key, Def.Values[Def.DefaultIndex].Name }, Why);
+
+			if (What.empty())
+			{
+				LOG_WARN(LogCreative, "Device defaults: {} holds {} on {}, not one of its choices, and the default '{}' could not be set ({})", Def.Key, Current, Describe(Actor), Def.Values[Def.DefaultIndex].Name, Why);
+				continue;
+			}
+
+			++Changed;
+			LOG_INFO(LogCreative, "Device defaults: {} held {} on {}, not one of its choices; now '{}' ({})", Def.Key, Current, Describe(Actor), Def.Values[Def.DefaultIndex].Name, What);
+
+			if (auto OnRep = Actor->FindFunction("OnRep_" + Def.Key))
+				SafeProcessEvent(Actor, OnRep, nullptr);
+		}
+
+		if (Changed > 0)
+			((AActor*)Actor)->ForceNetUpdate();
+
+		return Changed;
+	}
+
+		// What the move tool holds around a copy (duplicate) or cut request: the actors it was asked for, what it is already spawning (the duplicates it makes, the record spawner), and
+	// what its own checks say (it may spawn at all; the island volume it works in, with and without the permission check). The 7 Nov log shows the request arriving 17 times in
+	// 3 seconds and the server doing nothing visible afterwards, so these write down why.
+	static void LogMoveToolState(UObject* Tool, const char* When, const char* Request, int Count)
+	{
+		if (!Tool)
+			return;
+
+		auto ArrayCount = [&](const char* Name) {
+			const int Offset = Tool->GetOffset(Name, false);
+			return Offset > 0 && Readable((char*)Tool + Offset, 16) ? *(int*)((char*)Tool + Offset + 8) : -1;
+		};
+
+		const int SpawnerOffset = Tool->GetOffset("ActiveRecordSpawner", false);
+		UObject* Spawner = SpawnerOffset > 0 ? Tool->Get<UObject*>(SpawnerOffset) : nullptr;
+
+		bool bCan = false, bCanRan = false;
+
+		if (auto Function = Tool->FindFunction("CanUtilizeMoveToolSpawningFunctionality"))
+		{
+			struct { bool ReturnValue; char Pad[7]; } Params{};
+			bCanRan = SafeProcessEvent(Tool, Function, &Params);
+			bCan = Params.ReturnValue;
+		}
+
+		std::string Volumes;
+
+		for (bool bPermissions : { false, true })
+			if (auto Function = Tool->FindFunction("GetCurrentVolume"))
+			{
+				struct { bool bMustHavePermissions; char Pad[7]; UObject* ReturnValue; } Params{ bPermissions, {}, nullptr };
+				const bool bRan = SafeProcessEvent(Tool, Function, &Params);
+				Volumes += std::format("{}volume{} {}", Volumes.empty() ? "" : ", ", bPermissions ? " (with the permission check)" : "", bRan ? Describe(Params.ReturnValue) : std::string("(call failed)"));
+			}
+
+		LOG_INFO(LogCreative, "Move tool ({}) {}: {} actor(s) asked for; the tool holds {} to duplicate, {} spawned by the helper, {} newly placed, {} selected, record spawner {}; can spawn: {}; {}", When, Request, Count, ArrayCount("ToDuplicateActors"),
+			ArrayCount("SpawnHelperNewlyPlacedActors"), ArrayCount("NewlyPlacedActors"), ArrayCount("SelectedActors"), Describe(Spawner), bCanRan ? (bCan ? "yes" : "NO") : "unknown", Volumes);
+	}
+
 	// The change of an actor's options, before and after the game's own handler.
+
 	static void HandleActorOptions(UObject* Controller, void* Params, bool bAfter)
 	{
 		struct Request { UObject* Target; TArray<FString> Keys; TArray<FString> Values; };
@@ -4342,6 +4512,17 @@ namespace CreativeSettings
 
 			if (Direct > 0)
 				NotifyOptionsChanged(Component, R.Target);
+
+			// options named "Class:Property" are the mutators' (the voice chat channel ...), not the machine's: they go to the island's mutator list
+			std::vector<Option> Scoped;
+
+			for (auto& M : Missing)
+				if (M.Key.find(':') != std::string::npos)
+					Scoped.push_back(M);
+
+			if (!Scoped.empty())
+				if (auto List = MutatorListOf(Controller))
+					ApplyToMutatorList(List, Scoped);
 		}
 
 		if (CurrentOptions(Component, Now))
@@ -4354,39 +4535,139 @@ namespace CreativeSettings
 			Actor->ForceNetUpdate();
 	}
 
-	// The island's game settings (time limit, teams, lives ...): the settings machine's options component takes them.
+	// The island's mutator list (the volume's FortMutatorListComponent, "CreativeIslandMutatorList"): what the settings tab's gameplay options (time of day, light, fog,
+	// starting health, shields ...) are stored in. Their keys are "ClassOfTheSetting:Property", and the mutators listen to the list.
+	static UObject* MutatorListOf(UObject* Controller)
+	{
+		static auto ListClass = FindObject<UClass>(L"/Script/FortniteGame.FortMutatorListComponent");
+
+		if (!ListClass)
+			return nullptr;
+
+		AActor* Volume = nullptr;
+
+		if (auto Machine = SettingsMachine())
+		{
+			const int Offset = Machine->GetOffset("SettingsVolume", false);
+
+			if (Offset != -1)
+				Volume = Machine->Get<AActor*>(Offset);
+		}
+
+		if (!Volume && Controller)
+			Volume = ((AFortPlayerControllerAthena*)Controller)->GetCreativePlotLinkedVolume();
+
+		return Volume && PropDump::IsLiveObject(Volume) ? (UObject*)Volume->GetComponentByClass(ListClass) : nullptr;
+	}
+
+	static bool ListOverrides(UObject* List, std::vector<Option>& Out)
+	{
+		auto Function = List ? List->FindFunction("GetPropertyOverridesAsStrings") : nullptr;
+
+		if (!Function)
+			return false;
+
+		struct { char Map[0x50]; } Params{};
+
+		if (!SafeProcessEvent(List, Function, &Params))
+			return false;
+
+		Out = ReadStringMap(Params.Map);
+		return true;
+	}
+
+	// Sets options in the mutator list with its own function (merging with what it holds, or replacing it), and says what it holds afterwards.
+	static bool ApplyToMutatorList(UObject* List, const std::vector<Option>& Wanted)
+	{
+		std::vector<Option> Now;
+		ListOverrides(List, Now);
+
+		bool bHeld = false;
+
+		for (const char* Name : { "AddOrUpdatePropertyOverrides", "SetPropertyOverrides" })
+		{
+			auto Function = List->FindFunction(Name);
+
+			if (!Function)
+				continue;
+
+			std::vector<Option> Send = Wanted;
+
+			// SetPropertyOverrides replaces the whole list: what it holds stays
+			if (std::string(Name) == "SetPropertyOverrides")
+				for (auto& Held : Now)
+				{
+					bool bReplaced = false;
+
+					for (auto& W : Wanted)
+						bReplaced = bReplaced || W.Key == Held.Key;
+
+					if (!bReplaced)
+						Send.push_back(Held);
+				}
+
+			struct { char Map[0x50]; } Params{};
+			BuildStringMap(Params.Map, Send);
+			const bool bRan = SafeProcessEvent(List, Function, &Params);
+			std::vector<Option> After;
+			ListOverrides(List, After);
+			LOG_INFO(LogCreative, "Settings:   {} on the mutator list {} and now holds {} option(s), {} of the {} wanted among them", Name, bRan ? "ran" : "FAILED (exception)", (int)After.size(), Matching(Wanted, After), (int)Wanted.size());
+
+			if (Matching(Wanted, After) >= (int)Wanted.size())
+			{
+				bHeld = true;
+				break;
+			}
+		}
+
+		if (auto Resolve = List->FindFunction("ResolvePendingRepOverrides"))
+			SafeProcessEvent(List, Resolve, nullptr);
+
+		if (auto OnRep = List->FindFunction("OnRep_PropertyOverrideArray"))
+			SafeProcessEvent(List, OnRep, nullptr);
+
+		return bHeld;
+	}
+
+	// The island's game settings (time of day, light, fog, starting health ...): the island's mutator list takes them.
 	static void HandleGameplayOptions(UObject* Controller, void* Params, bool bAfter)
 	{
 		struct Request { TArray<FString> Keys; TArray<FString> Values; };
 		auto& R = *(Request*)Params;
 		const auto Wanted = ReadOptions(R.Keys, R.Values);
-		auto Machine = SettingsMachine();
-		auto Component = OptionsComponentOf(Machine);
+		auto List = MutatorListOf(Controller);
 
 		if (!bAfter)
 		{
-			LOG_INFO(LogCreative, "Settings: {} asks to change {} game option(s) (settings machine {}, {}): {}", Describe(Controller), (int)Wanted.size(), Describe(Machine),
-				Component ? "has an options component" : "NO options component", Summary(Wanted, 30));
-
 			std::vector<Option> Before;
+			const bool bRead = ListOverrides(List, Before);
+			LOG_INFO(LogCreative, "Settings: {} asks to change {} game option(s); the island's mutator list is {} ({} option(s) held before): {}", Describe(Controller), (int)Wanted.size(), List ? Describe(List) : std::string("NOT FOUND"),
+				bRead ? (int)Before.size() : -1, Summary(Wanted, 30));
 
-			if (Component && CurrentOptions(Component, Before))
-				LOG_INFO(LogCreative, "Settings:   before: {} option(s) set on the machine: {}", (int)Before.size(), Summary(Before));
+			static bool bDumped = false;
 
-			LogEditAccess(Component, ControllerPawn(Controller));
+			if (List && !bDumped)
+			{
+				bDumped = true;
+				PropDump::DumpObject("Mutator list", List, 1, 70);
+			}
+
 			return;
 		}
 
-		if (!Component || Wanted.empty())
+		if (!List || Wanted.empty())
 			return;
 
 		std::vector<Option> Now;
 
-		if (!CurrentOptions(Component, Now))
+		if (!ListOverrides(List, Now))
+		{
+			LOG_WARN(LogCreative, "Settings:   the mutator list {} can not be read (no GetPropertyOverridesAsStrings)", Describe(List));
 			return;
+		}
 
 		const int Set = Matching(Wanted, Now);
-		LOG_INFO(LogCreative, "Settings:   after the game's handler: {} of {} requested option(s) are on the machine ({} set in all): {}", Set, (int)Wanted.size(), (int)Now.size(), Summary(Now, 30));
+		LOG_INFO(LogCreative, "Settings:   after the game's handler: {} of {} requested game option(s) are in the mutator list ({} held in all): {}", Set, (int)Wanted.size(), (int)Now.size(), Summary(Now, 30));
 
 		if (Set >= (int)Wanted.size())
 			return;
@@ -4397,13 +4678,10 @@ namespace CreativeSettings
 			if (Matching({ W }, Now) == 0)
 				Missing.push_back(W);
 
-		LOG_WARN(LogCreative, "Settings:   {} game option(s) are not on the machine, setting them there: {}", (int)Missing.size(), Summary(Missing, 30));
-		ApplyOptions(Component, Missing);
+		LOG_WARN(LogCreative, "Settings:   {} game option(s) are not in the mutator list, putting them there: {}", (int)Missing.size(), Summary(Missing, 30));
+		ApplyToMutatorList(List, Missing);
 
-		if (CurrentOptions(Component, Now))
-			LOG_INFO(LogCreative, "Settings:   after our own change: {} of {} requested option(s) are on the machine", Matching(Wanted, Now), (int)Wanted.size());
-
-		if (auto Actor = (AActor*)Machine)
+		if (auto Actor = (AActor*)((AFortPlayerControllerAthena*)Controller)->GetCreativePlotLinkedVolume())
 			Actor->ForceNetUpdate();
 	}
 
@@ -4445,8 +4723,36 @@ namespace CreativeSettings
 			LOG_INFO(LogCreative, "Settings: {} asks to change the game name and description of {}", Describe(Context), Describe(((Request*)Params)->Target));
 			break;
 		}
-		case DeviceButton:
-		{
+					case MoveDuplicate:
+			case MoveCut:
+			case MoveSpawn:
+			{
+				static int Logged[KindCount] = {};
+
+				if (++Logged[Kind] > 40)
+					break;
+
+				const char* Request = Kind == MoveDuplicate ? "ServerDuplicateStartInteracting" : (Kind == MoveCut ? "ServerHandshakeFromClientForReceivingCutActors" : "ServerSpawnSelectedActorsWithTransform");
+				int Count = -1;
+				std::string Names;
+
+				if (Kind == MoveDuplicate)
+				{
+					struct Request_ { TArray<UObject*> Actors; };
+					auto& R = *(Request_*)Params;
+					Count = R.Actors.Num();
+
+					for (int i = 0; i < R.Actors.Num() && i < 6; ++i)
+						Names += (i ? ", " : "") + Describe(R.Actors.at(i));
+
+					LOG_INFO(LogCreative, "Move tool: {} asks to duplicate: {}", Describe(Context), Names.empty() ? std::string("(no actors)") : Names);
+				}
+
+				LogMoveToolState(Context, "before", Request, Count);
+				break;
+			}
+			case DeviceButton:
+			{
 			struct Request { UObject* Component; };
 			LOG_INFO(LogCreative, "Settings: {} pressed a device button: {}", Describe(Context), Describe(((Request*)Params)->Component));
 			break;
@@ -4483,10 +4789,17 @@ namespace CreativeSettings
 		if (!Params)
 			return;
 
-		if (Kind == ActorOptions)
+				if (Kind == ActorOptions)
 			HandleActorOptions(Context, Params, true);
 		else if (Kind == GameplayOptions)
 			HandleGameplayOptions(Context, Params, true);
+		else if (Kind == MoveDuplicate || Kind == MoveCut || Kind == MoveSpawn)
+		{
+			static int Logged = 0;
+
+			if (++Logged <= 40)
+				LogMoveToolState(Context, "after", Kind == MoveDuplicate ? "ServerDuplicateStartInteracting" : (Kind == MoveCut ? "ServerHandshakeFromClientForReceivingCutActors" : "ServerSpawnSelectedActorsWithTransform"), -1);
+		}
 	}
 
 	// What a device holds after it was placed: its options component (the asset that lists its options, what is set, whether the player may edit it) and,
@@ -4514,6 +4827,7 @@ namespace CreativeSettings
 
 			LOG_INFO(LogCreative, "Device check:   options asset {}, {} option(s) set: {}", Describe(OptionsAssetOffset == -1 ? nullptr : Component->Get<UObject*>(OptionsAssetOffset)), (int)Set.size(), Summary(Set, 8));
 			LogComponent("when placed", Component);
+			ApplyDefaultOptions(Device, Component);
 			LogEditAccess(Component, ControllerPawn(BuilderController));
 		}
 
@@ -5455,19 +5769,50 @@ namespace CreativeMinigame
 
 			LOG_INFO(LogCreative, "Minigame driver: OnPlayerPawnPossessedDuringTransition for {}: the pawn {} ({} -> {})", Describe(Pawn), bMoved ? "was moved by the game" : "was not moved", BeforeText, Where(Pawn));
 
-			// If the game left the pawn where it was, the minigame is asked where this player spawns (its own choice between spawn pads, sky and current location), then the plate.
+			// If the game left the pawn where it was: on a Player Start plate when the island has one; else as the island's spawn location setting says (Sky: where the minigame
+			// puts a player in the air; Current Location: where the pawn is), and with the setting on Spawn Pads and no plate, at the island's start on the ground.
+			// The 7 Nov log: the minigame's own choice with no plates is 15000 up, the pawn was still falling when the game ended, outside the island's volume,
+			// and the game went from PostGameEnd to PostGameReset in the same millisecond: no end screen.
 			if (!bMoved)
 			{
-				struct { UObject* PlayerState; FVector Location; FRotator Rotation; bool bOnGround; bool ReturnValue; } Spawn{ Player->GetPlayerState(), FVector(), FRotator(), false, false };
-				const bool bAsked = Call(Minigame, "DetermineSpawnLocation", &Spawn);
-				LOG_INFO(LogCreative, "Minigame driver: DetermineSpawnLocation for {}: {} ({} {} {})", Describe(Pawn), bAsked ? (Spawn.ReturnValue ? "a location" : "no location") : "not available", Spawn.Location.X, Spawn.Location.Y, Spawn.Location.Z);
-
-				if (bAsked && Spawn.ReturnValue && (Spawn.Location.X != 0.f || Spawn.Location.Y != 0.f))
+				std::string Setting = "?";
 				{
-					Pawn->TeleportTo(Spawn.Location, Spawn.Rotation);
-					LOG_INFO(LogCreative, "Minigame driver: moved {} to the minigame's spawn location {}", Describe(Pawn), Where(Pawn));
+					auto SettingProperty = (const char*)Minigame->GetProperty("SpawnLocationSetting", false);
+					const int SettingOffset = Minigame->GetOffset("SpawnLocationSetting", false);
+
+					if (SettingProperty && SettingOffset != -1)
+						Setting = PropDump::EnumName(*(const void* const*)(SettingProperty + PropDump::InnerAt), *((const unsigned char*)Minigame + SettingOffset));
 				}
-				else if (auto Plate = NearestStartPlate(Pawn))
+
+				auto Plate = NearestStartPlate(Pawn);
+				const bool bAir = LowerText(Setting) == "air" || LowerText(Setting) == "sky";
+				const bool bCurrent = LowerText(Setting) == "currentlocation";
+				LOG_INFO(LogCreative, "Minigame driver: spawn location setting {}, {}", Setting, Plate ? "the island has a player start plate" : "the island has no player start plate");
+
+				if (!Plate && !bCurrent)
+				{
+					struct { UObject* PlayerState; FVector Location; FRotator Rotation; bool bOnGround; bool ReturnValue; } Spawn{ Player->GetPlayerState(), FVector(), FRotator(), false, false };
+					const bool bAsked = bAir && Call(Minigame, "DetermineSpawnLocation", &Spawn);
+
+					FVector StartLocation;
+					FRotator StartRotation;
+
+					if (bAsked && Spawn.ReturnValue && (Spawn.Location.X != 0.f || Spawn.Location.Y != 0.f))
+					{
+						Pawn->TeleportTo(Spawn.Location, Spawn.Rotation);
+						LOG_INFO(LogCreative, "Minigame driver: moved {} to the minigame's spawn location {}", Describe(Pawn), Where(Pawn));
+					}
+					else if (auto Volume = IslandVolumeOf(Player); Volume && FindIslandStart(Volume, StartLocation, StartRotation))
+					{
+						Pawn->TeleportTo(StartLocation, StartRotation);
+						LOG_INFO(LogCreative, "Minigame driver: moved {} to the island's start {}", Describe(Pawn), Where(Pawn));
+					}
+					else
+					{
+						LOG_INFO(LogCreative, "Minigame driver: no spawn location found for {}, it stays where it is", Describe(Pawn));
+					}
+				}
+				else if (Plate)
 				{
 					auto Location = Plate->GetActorLocation();
 					Location.Z += 150;
@@ -5522,6 +5867,14 @@ namespace CreativeMinigame
 			D.State = State;
 			D.Since = Now;
 			D.bAdvanced = false;
+
+				for (auto Player : ControllersOn(Volume))
+				{
+					struct { UObject* PlayerState; bool ReturnValue; } Inside{ Player->GetPlayerState(), false };
+
+					if (Call(Minigame, "IsPlayerInOurVolume", &Inside))
+						LOG_INFO(LogCreative, "Minigame driver: {} is {} the island's volume at {}", Describe(Player), Inside.ReturnValue ? "INSIDE" : "OUTSIDE", Player->GetMyFortPawn() ? Where(Player->GetMyFortPawn()) : std::string("(no pawn)"));
+				}
 
 			if (State == Transitioning) { D.bAdded = false; D.bPossessed = false; D.bStartedHandled = false; }
 			if (State == WaitingForCameras) D.bCameras = false;
